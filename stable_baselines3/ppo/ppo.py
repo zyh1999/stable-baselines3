@@ -266,9 +266,9 @@ class PPO(OnPolicyAlgorithm):
         actor_grad_norms: list[np.ndarray] = []
         critic_grad_norms: list[np.ndarray] = []
         continue_training = True
+        approx_kl_divs = []
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
-            approx_kl_divs = []
             # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get(self.batch_size):
                 actions = rollout_data.actions
@@ -343,13 +343,17 @@ class PPO(OnPolicyAlgorithm):
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
                 # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
                 # and Schulman blog: http://joschu.net/blog/kl-approx.html
-                with th.no_grad():
-                    log_ratio = log_prob - rollout_data.old_log_prob
-                    approx_kl_div = th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
-                    approx_kl_divs.append(approx_kl_div)
 
                 if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
                     continue_training = False
+
+                if epoch == range(self.n_epochs) - 1 or not continue_training:
+                    with th.no_grad():
+                        log_ratio = log_prob - rollout_data.old_log_prob
+                        approx_kl_div = th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+                        approx_kl_divs.append(approx_kl_div)
+
+                if not continue_training:
                     if self.verbose >= 1:
                         print(f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}")
                     break
