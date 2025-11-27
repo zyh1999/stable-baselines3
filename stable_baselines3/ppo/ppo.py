@@ -360,21 +360,35 @@ class PPO(OnPolicyAlgorithm):
                 score_grads_dict: Optional[dict[int, th.Tensor]] = None
                 if self.separate_optimizers and isinstance(self.actor_optimizer, ScoreAdam):
                     assert self._actor_params is not None
-                    # Build an "actor score loss" that mirrors the PPO clipping decision
-                    # (via use_clipped_mask), but without scaling by the advantages.
+                    # 1) 构造逐样本的 "score-only" actor loss：
+                    #    - 保留 ratio / clip 结构
+                    #    - 去掉 advantage 和 entropy 的缩放（分母只看 score）
                     score_unclipped = ratio
                     score_clipped = th.clamp(ratio, 1 - clip_range, 1 + clip_range)
-                    # For samples where PPO would use the clipped objective, we use
-                    # the clipped ratio; otherwise, we use the unclipped ratio.
-                    score_objective = th.where(use_clipped_mask, score_clipped, score_unclipped)
-                    policy_score_loss = -score_objective.mean()
-                    actor_score_loss = policy_score_loss + self.ent_coef * entropy_loss
+                    # PPO 原始目标在每个样本上选择 unclipped 或 clipped，这里用同一个 mask
+                    score_objective = th.where(use_clipped_mask, score_clipped, score_unclipped)  # [batch]
+                    # 仅用 policy 的 score 部分作为逐样本 loss
+                    actor_score_per_sample = -score_objective
 
-                    score_grads = th.autograd.grad(
-                        actor_score_loss, self._actor_params, retain_graph=True, allow_unused=True
-                    )
+                    # 2) 用逐样本梯度的平方期望来近似 Fisher 对角线：
+                    #    F_ii ≈ E[ (∂ actor_score / ∂ θ_i)^2 ] over samples
+                    fisher_diag: dict[int, th.Tensor] = {
+                        id(p): th.zeros_like(p) for p in self._actor_params
+                    }
+                    batch_size = actor_score_per_sample.shape[0]
+                    for j in range(batch_size):
+                        score_loss_j = actor_score_per_sample[j]
+                        per_grads = th.autograd.grad(
+                            score_loss_j, self._actor_params, retain_graph=True, allow_unused=True
+                        )
+                        for p, g in zip(self._actor_params, per_grads):
+                            if g is not None:
+                                fisher_diag[id(p)] += g * g
+
+                    # 3) 取样本平均并开方，再交给 ScoreAdam，ScoreAdam 内部会再平方，
+                    #    得到的就是基于 per-sample 梯度外积对角线的二阶矩估计。
                     score_grads_dict = {
-                        id(p): g for p, g in zip(self._actor_params, score_grads) if g is not None
+                        pid: (acc / batch_size).sqrt() for pid, acc in fisher_diag.items()
                     }
 
                 # Optimization step
