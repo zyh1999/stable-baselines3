@@ -50,9 +50,12 @@ class ScoreAdam(th.optim.Optimizer):
         Perform a single optimization step.
 
         :param closure: Optional closure that re-evaluates the model and returns the loss.
-        :param score_grads: Optional dict mapping id(param) -> score-only gradient tensor.
-            If provided, the second-moment (denominator) will use these gradients instead
-            of the full gradient. If a param is missing, its normal gradient is used.
+        :param score_grads: Optional dict mapping id(param) -> second-moment estimate tensor.
+            The values are expected to be (per-parameter) estimates of E[g^2] constructed
+            from score-only gradients (e.g. Fisher-diagonal-like statistics).
+            If provided, the second-moment (denominator) will use these estimates instead
+            of the full-gradient-based estimate grad * grad. If a param is missing, its
+            normal gradient-based second moment is used.
         """
         loss = None
         if closure is not None:
@@ -97,14 +100,20 @@ class ScoreAdam(th.optim.Optimizer):
                 # Use true gradient (includes advantage) for first moment
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
 
-                # For the denominator, optionally use score-only gradient
-                score_grad = grad
+                # For the denominator, optionally use a pre-computed second-moment estimate
+                # (e.g. E[g^2] from score-only gradients). If none is provided for this
+                # parameter, fall back to the standard grad * grad estimate.
                 if score_grads is not None:
-                    maybe_sg = score_grads.get(id(p))
-                    if maybe_sg is not None:
-                        score_grad = maybe_sg
+                    maybe_second_moment = score_grads.get(id(p))
+                    if maybe_second_moment is not None:
+                        second_moment = maybe_second_moment
+                    else:
+                        second_moment = grad * grad
+                else:
+                    second_moment = grad * grad
 
-                exp_avg_sq.mul_(beta2).addcmul_(score_grad, score_grad, value=1 - beta2)
+                # Standard Adam-style EMA of the (approximate) second moment
+                exp_avg_sq.mul_(beta2).add_(second_moment, alpha=1 - beta2)
 
                 if amsgrad:
                     max_exp_avg_sq = state["max_exp_avg_sq"]

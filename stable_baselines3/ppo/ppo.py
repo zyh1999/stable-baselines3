@@ -72,6 +72,16 @@ class PPO(OnPolicyAlgorithm):
     :param separate_optimizers: If True, use two optimizers to update actor and critic separately
         (hyperparameters identical). Shared feature extractor (if any) is updated once using
         the combined gradients from both losses.
+    :param use_score_fisher: When using ``ScoreAdam`` for the actor with separate optimizers,
+        controls how the second-moment estimate is constructed:
+        - If True (default), use score-only per-sample losses (without advantage) to build a
+          Fisher-like diagonal E[g^2].
+        - If False, use the true per-sample actor loss (policy + entropy terms) to build E[g^2].
+    :param use_adam_ablation: When using ``ScoreAdam`` for the actor, enable an Adam-style ablation:
+        - The numerator uses per-sample actor gradients with max_grad_norm clipping, then averages them
+          to build E[g].
+        - The denominator uses (E[g])^2 as the second-moment estimate, mimicking standard Adam while
+          still exposing per-sample control.
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
     """
 
@@ -112,6 +122,8 @@ class PPO(OnPolicyAlgorithm):
         normalize_advantage_mean: bool = True,
         normalize_advantage_std: bool = True,
         separate_optimizers: bool = True,
+        use_score_fisher: bool = True,
+        use_adam_ablation: bool = False,
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -178,6 +190,10 @@ class PPO(OnPolicyAlgorithm):
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
         self.separate_optimizers = separate_optimizers
+        # 控制 ScoreAdam 的二阶矩是基于 score 还是基于真实 actor loss 的梯度
+        self.use_score_fisher = use_score_fisher
+        # 消融开关：让 ScoreAdam 按“普通 Adam”风格工作（分子/分母都基于 batch-mean 梯度）
+        self.use_adam_ablation = use_adam_ablation
 
         # Split-optimizer related attributes
         self.actor_optimizer: Optional[th.optim.Optimizer] = None
@@ -259,7 +275,29 @@ class PPO(OnPolicyAlgorithm):
         entropy_losses = []
         pg_losses, value_losses = [], []
         clip_fractions = []
+        # New metrics: clip fraction for advantages < threshold
+        clip_fractions_adv_02 = []
+        clip_fractions_adv_04 = []
+        clip_fractions_adv_06 = []
+        clip_fractions_adv_08 = []
+        clip_fractions_adv_10 = []
+        
+        # New: Record the fraction of samples falling into each advantage range
+        frac_adv_02 = []
+        frac_adv_04 = []
+        frac_adv_06 = []
+        frac_adv_08 = []
+        frac_adv_10 = []
+        
         batch_advantages = []
+        
+        # New: Percentile-based clip fractions (0-20%, 20-40%, etc.)
+        clip_frac_p0_20 = []
+        clip_frac_p20_40 = []
+        clip_frac_p40_60 = []
+        clip_frac_p60_80 = []
+        clip_frac_p80_100 = []
+
         batch_norm_advantages = []
         ratios = []
         grad_norms = []
@@ -315,6 +353,55 @@ class PPO(OnPolicyAlgorithm):
                 clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
                 clip_fractions.append(clip_fraction)
 
+                # Calculate clip fractions for different advantage magnitudes
+                with th.no_grad():
+                    adv_abs = th.abs(advantages)
+                    clipped = (th.abs(ratio - 1) > clip_range).float()
+                    for threshold, storage, frac_storage in [
+                        (0.2, clip_fractions_adv_02, frac_adv_02),
+                        (0.4, clip_fractions_adv_04, frac_adv_04),
+                        (0.6, clip_fractions_adv_06, frac_adv_06),
+                        (0.8, clip_fractions_adv_08, frac_adv_08),
+                        (1.0, clip_fractions_adv_10, frac_adv_10),
+                    ]:
+                        mask = adv_abs < threshold
+                        frac_storage.append(mask.float().mean().item())
+                        if mask.any():
+                            storage.append(((clipped * mask).sum() / mask.sum()).item())
+
+                # New: Calculate clip fractions for advantage percentiles (0-20%, 20-40%, etc.)
+                # This separates samples by their RELATIVE rank in the batch, not absolute value.
+                with th.no_grad():
+                    adv_abs = th.abs(advantages)
+                    # Sort advantages to identify indices for each percentile bucket
+                    # argsort gives the indices that would sort the array
+                    sorted_indices = th.argsort(adv_abs)
+                    batch_size = len(adv_abs)
+                    
+                    # Define bucket boundaries
+                    idx_20 = int(batch_size * 0.2)
+                    idx_40 = int(batch_size * 0.4)
+                    idx_60 = int(batch_size * 0.6)
+                    idx_80 = int(batch_size * 0.8)
+                    
+                    # Create masks for each bucket based on sorted order
+                    # We create a boolean mask of the same shape as adv_abs
+                    indices_groups = [
+                        (sorted_indices[:idx_20], clip_frac_p0_20),
+                        (sorted_indices[idx_20:idx_40], clip_frac_p20_40),
+                        (sorted_indices[idx_40:idx_60], clip_frac_p40_60),
+                        (sorted_indices[idx_60:idx_80], clip_frac_p60_80),
+                        (sorted_indices[idx_80:], clip_frac_p80_100),
+                    ]
+                    
+                    clipped_batch = (th.abs(ratio - 1) > clip_range).float()
+                    
+                    for indices, storage in indices_groups:
+                        if len(indices) > 0:
+                            # Calculate clip fraction for samples in this percentile range
+                            fraction = clipped_batch[indices].mean().item()
+                            storage.append(fraction)
+
                 if self.clip_range_vf is None:
                     # No clipping
                     values_pred = values
@@ -354,42 +441,105 @@ class PPO(OnPolicyAlgorithm):
                         print(f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}")
                     break
 
-                # Optional: compute score-only gradients (∇ log π and ratio/clip structure,
-                # but without advantage scaling) for ScoreAdam. We re-use the clipping
-                # decision from the true PPO objective via `use_clipped_mask`.
+                # Optional: compute per-sample gradients for ScoreAdam.
+                #
+                # 对 ScoreAdam 有三种模式（仅在 separate_optimizers=True 时启用）：
+                # - use_score_fisher=True 且 use_adam_ablation=False:
+                #     分母用基于 score-only 的 E[g^2]（Fisher 对角近似），分子来自标准 batch loss backward。
+                # - use_score_fisher=False 且 use_adam_ablation=False:
+                #     分母用基于真实 actor loss（含 advantage + 熵）的 E[g^2]。
+                # - use_adam_ablation=True:
+                #     做“普通 Adam”的消融版本：
+                #       * 分子：对 per-sample 的 actor loss 梯度先做 max_grad_norm 裁剪，再取平均 E[g]；
+                #       * 分母：对这个平均梯度按元素平方得到 (E[g])^2，传给 ScoreAdam 作为自适应二阶矩。
+                #     这样就模拟了 Adam 中基于 batch-mean 梯度的二阶矩估计，但仍然保留 per-sample 级别的裁剪控制。
                 score_grads_dict: Optional[dict[int, th.Tensor]] = None
+                actor_mean_grads_dict: Optional[dict[int, th.Tensor]] = None
                 if self.separate_optimizers and isinstance(self.actor_optimizer, ScoreAdam):
                     assert self._actor_params is not None
-                    # 1) 构造逐样本的 "score-only" actor loss：
-                    #    - 保留 ratio / clip 结构
-                    #    - 去掉 advantage 和 entropy 的缩放（分母只看 score）
-                    score_unclipped = ratio
-                    score_clipped = th.clamp(ratio, 1 - clip_range, 1 + clip_range)
-                    # PPO 原始目标在每个样本上选择 unclipped 或 clipped，这里用同一个 mask
-                    score_objective = th.where(use_clipped_mask, score_clipped, score_unclipped)  # [batch]
-                    # 仅用 policy 的 score 部分作为逐样本 loss
-                    actor_score_per_sample = -score_objective
 
-                    # 2) 用逐样本梯度的平方期望来近似 Fisher 对角线：
-                    #    F_ii ≈ E[ (∂ actor_score / ∂ θ_i)^2 ] over samples
-                    fisher_diag: dict[int, th.Tensor] = {
+                    # 选择 per-sample loss 的模式
+                    if self.use_adam_ablation:
+                        # Adam 消融 & true-Fisher 都使用真实 actor loss（policy + entropy）
+                        # 这里只是先构造逐样本的 actor loss，后续根据 use_adam_ablation 决定如何聚合梯度
+                        policy_loss_per_sample = -th.min(policy_loss_1, policy_loss_2)  # [batch]
+                        if entropy is None:
+                            # 与上面 entropy_loss = -mean(-log_prob) 对应：逐样本为 log_prob
+                            entropy_loss_per_sample = -(-log_prob)  # = log_prob
+                        else:
+                            # 与上面 entropy_loss = -mean(entropy) 对应：逐样本为 -entropy
+                            entropy_loss_per_sample = -entropy
+                        per_sample_loss = policy_loss_per_sample + self.ent_coef * entropy_loss_per_sample  # [batch]
+                    elif self.use_score_fisher:
+                        # 1) 基于 "score-only" 的逐样本 loss：
+                        #    - 保留 ratio / clip 结构
+                        #    - 去掉 advantage 和 entropy 的缩放（分母只看 score）
+                        score_unclipped = ratio
+                        score_clipped = th.clamp(ratio, 1 - clip_range, 1 + clip_range)
+                        # PPO 原始目标在每个样本上选择 unclipped 或 clipped，这里用同一个 mask
+                        score_objective = th.where(use_clipped_mask, score_clipped, score_unclipped)  # [batch]
+                        # 仅用 policy 的 score 部分作为逐样本 loss
+                        per_sample_loss = -score_objective
+                    else:
+                        # True-Fisher：基于真实 actor loss（policy + entropy）的逐样本 loss，用于构造 E[g^2]
+                        policy_loss_per_sample = -th.min(policy_loss_1, policy_loss_2)  # [batch]
+                        if entropy is None:
+                            entropy_loss_per_sample = -(-log_prob)  # = log_prob
+                        else:
+                            entropy_loss_per_sample = -entropy
+                        per_sample_loss = policy_loss_per_sample + self.ent_coef * entropy_loss_per_sample  # [batch]
+
+                    # 2) 逐样本梯度计算
+                    #
+                    # - Fisher / True-Fisher 模式：累积 g^2
+                    # - Adam 消融模式：累积原始梯度 g，用于后续计算 batch 平均梯度
+                    second_moment_acc: dict[int, th.Tensor] = {
                         id(p): th.zeros_like(p) for p in self._actor_params
                     }
-                    batch_size = actor_score_per_sample.shape[0]
-                    for j in range(batch_size):
-                        score_loss_j = actor_score_per_sample[j]
-                        per_grads = th.autograd.grad(
-                            score_loss_j, self._actor_params, retain_graph=True, allow_unused=True
-                        )
-                        for p, g in zip(self._actor_params, per_grads):
-                            if g is not None:
-                                fisher_diag[id(p)] += g * g
+                    if self.use_adam_ablation:
+                        actor_grad_sum: dict[int, th.Tensor] = {
+                            id(p): th.zeros_like(p) for p in self._actor_params
+                        }
 
-                    # 3) 取样本平均并开方，再交给 ScoreAdam，ScoreAdam 内部会再平方，
-                    #    得到的就是基于 per-sample 梯度外积对角线的二阶矩估计。
-                    score_grads_dict = {
-                        pid: (acc / batch_size).sqrt() for pid, acc in fisher_diag.items()
-                    }
+                    batch_size = per_sample_loss.shape[0]
+                    for j in range(batch_size):
+                        loss_j = per_sample_loss[j]
+                        per_grads = th.autograd.grad(
+                            loss_j, self._actor_params, retain_graph=True, allow_unused=True
+                        )
+                        
+                        for p, g in zip(self._actor_params, per_grads):
+                            if g is None:
+                                continue
+                            pid = id(p)
+                            if self.use_adam_ablation:
+                                # Adam ablation: Accumulate RAW gradients
+                                actor_grad_sum[pid] += g
+                            else:
+                                # Fisher / True-Fisher: accumulate g^2
+                                second_moment_acc[pid] += g * g
+
+                    if self.use_adam_ablation:
+                        # Adam ablation:
+                        # 1. Calculate E[g] using accumulated RAW gradients
+                        actor_mean_grads_dict = {
+                            pid: (g_sum / batch_size) for pid, g_sum in actor_grad_sum.items()
+                        }
+                        
+                        # 2. Clip the AVERAGED gradients E[g] (Standard Adam/PPO behavior)
+                        mean_grads_list = [actor_mean_grads_dict[id(p)] for p in self._actor_params]
+                        if th.isfinite(th.as_tensor(self.max_grad_norm)) and self.max_grad_norm > 0:
+                            th.nn.utils.clip_grad_norm_(mean_grads_list, self.max_grad_norm)
+                            
+                        # 3. Square the CLIPPED averaged gradients to get (E[g])^2
+                        score_grads_dict = {
+                            id(p): (g_mean * g_mean) for p, g_mean in zip(self._actor_params, mean_grads_list)
+                        }
+                    else:
+                        # Fisher / True-Fisher: 对 score-only 或真实 actor loss 的梯度做 E[g^2]
+                        score_grads_dict = {
+                            pid: (acc / batch_size) for pid, acc in second_moment_acc.items()
+                        }
 
                 # Optimization step
                 if self.separate_optimizers:
@@ -402,9 +552,25 @@ class PPO(OnPolicyAlgorithm):
 
                     # Backward actor then critic
                     actor_loss = policy_loss + self.ent_coef * entropy_loss
-                    actor_loss.backward(retain_graph=True)
                     critic_loss = self.vf_coef * value_loss
-                    critic_loss.backward()
+
+                    if isinstance(self.actor_optimizer, ScoreAdam) and self.use_adam_ablation:
+                        # 普通 Adam 消融版本：
+                        # 1) 先对 critic 做 backward，拿到 critic 及共享特征提取器的梯度；
+                        critic_loss.backward()
+                        # 2) 再把基于 per-sample 的 actor 平均梯度 E[g] 加到 actor 参数（含共享特征）上；
+                        assert actor_mean_grads_dict is not None
+                        for p in self._actor_params:
+                            pid = id(p)
+                            g_actor = actor_mean_grads_dict[pid]
+                            if p.grad is None:
+                                p.grad = g_actor.detach().clone()
+                            else:
+                                p.grad = p.grad + g_actor.detach()
+                    else:
+                        # 原始行为：actor + critic 一起 backward，分子来自批量 loss
+                        actor_loss.backward(retain_graph=True)
+                        critic_loss.backward()
 
                     # Clip and step actor (includes shared params)
                     actor_grad_norms.append(
@@ -452,6 +618,37 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/value_loss", np.mean(value_losses))
         self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
+
+        if len(clip_fractions_adv_02) > 0:
+            self.logger.record("train/clip_fraction_adv_lt_0.2", np.mean(clip_fractions_adv_02))
+            self.logger.record("train/adv_fraction_lt_0.2", np.mean(frac_adv_02))
+        if len(clip_fractions_adv_04) > 0:
+            self.logger.record("train/clip_fraction_adv_lt_0.4", np.mean(clip_fractions_adv_04))
+            self.logger.record("train/adv_fraction_lt_0.4", np.mean(frac_adv_04))
+        if len(clip_fractions_adv_06) > 0:
+            self.logger.record("train/clip_fraction_adv_lt_0.6", np.mean(clip_fractions_adv_06))
+            self.logger.record("train/adv_fraction_lt_0.6", np.mean(frac_adv_06))
+        if len(clip_fractions_adv_08) > 0:
+            self.logger.record("train/clip_fraction_adv_lt_0.8", np.mean(clip_fractions_adv_08))
+            self.logger.record("train/adv_fraction_lt_0.8", np.mean(frac_adv_08))
+        if len(clip_fractions_adv_10) > 0:
+            self.logger.record("train/clip_fraction_adv_lt_1.0", np.mean(clip_fractions_adv_10))
+            self.logger.record("train/adv_fraction_lt_1.0", np.mean(frac_adv_10))
+
+        if len(clip_frac_p0_20) > 0:
+            self.logger.record("train/clip_frac_p0_20", np.mean(clip_frac_p0_20))
+        if len(clip_frac_p20_40) > 0:
+            self.logger.record("train/clip_frac_p20_40", np.mean(clip_frac_p20_40))
+        if len(clip_frac_p40_60) > 0:
+            self.logger.record("train/clip_frac_p40_60", np.mean(clip_frac_p40_60))
+        if len(clip_frac_p60_80) > 0:
+            self.logger.record("train/clip_frac_p60_80", np.mean(clip_frac_p60_80))
+        if len(clip_frac_p80_100) > 0:
+            self.logger.record("train/clip_frac_p80_100", np.mean(clip_frac_p80_100))
+
+        if len(batch_advantages) > 0:
+             self.logger.record("train/advantages_abs_mean", np.mean(np.abs(batch_advantages)))
+
         # Record last combined loss value
         self.logger.record("train/loss", combined_loss.item())
         self.logger.record("train/explained_variance", explained_var)
