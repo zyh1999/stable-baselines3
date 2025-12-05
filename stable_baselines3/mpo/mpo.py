@@ -132,6 +132,8 @@ class MPO(OffPolicyAlgorithm):
         action_penalization: bool = True,
         epsilon_penalty: float = 1e-3,
         num_sample_actions: int = 20,
+        # Dual learning rate (typically higher than actor/critic LR)
+        dual_learning_rate: float = 1e-2,
         use_sde: bool = False,
         sde_sample_freq: int = -1,
         use_sde_at_warmup: bool = False,
@@ -173,16 +175,17 @@ class MPO(OffPolicyAlgorithm):
         )
 
         # MPO Hyperparameters
-        self.epsilon = epsilon
-        self.epsilon_mean = epsilon_mean
-        self.epsilon_stddev = epsilon_stddev
-        self.init_log_temperature = init_log_temperature
-        self.init_log_alpha_mean = init_log_alpha_mean
-        self.init_log_alpha_stddev = init_log_alpha_stddev
+        self.epsilon = float(epsilon)
+        self.epsilon_mean = float(epsilon_mean)
+        self.epsilon_stddev = float(epsilon_stddev)
+        self.init_log_temperature = float(init_log_temperature)
+        self.init_log_alpha_mean = float(init_log_alpha_mean)
+        self.init_log_alpha_stddev = float(init_log_alpha_stddev)
         self.per_dim_constraining = per_dim_constraining
         self.action_penalization = action_penalization
-        self.epsilon_penalty = epsilon_penalty
+        self.epsilon_penalty = float(epsilon_penalty)
         self.num_sample_actions = num_sample_actions
+        self.dual_learning_rate = dual_learning_rate
 
         # Dual variables containers
         self.log_temperature: Optional[th.Tensor] = None
@@ -210,9 +213,13 @@ class MPO(OffPolicyAlgorithm):
         self.batch_norm_stats_target = get_parameters_by_name(self.critic_target, ["running_"])
         
         # Initialize MPO Dual Variables
-        action_dim = np.prod(self.action_space.shape)
+        action_dim = int(np.prod(self.action_space.shape))
         if self.per_dim_constraining:
             dual_shape = (action_dim,)
+            # Scale epsilon by action dimension for per-dimension constraint
+            # This ensures epsilon represents the target KL per dimension
+            self.epsilon_mean = self.epsilon_mean / action_dim
+            self.epsilon_stddev = self.epsilon_stddev / action_dim
         else:
             dual_shape = (1,)
         
@@ -231,7 +238,8 @@ class MPO(OffPolicyAlgorithm):
         else:
             self.log_penalty_temperature = None
         
-        self.dual_optimizer = th.optim.Adam(dual_params, lr=self.lr_schedule(1))
+        # Use separate learning rate for dual variables
+        self.dual_optimizer = th.optim.Adam(dual_params, lr=self.dual_learning_rate)
 
     def _create_aliases(self) -> None:
         self.actor = self.policy.actor

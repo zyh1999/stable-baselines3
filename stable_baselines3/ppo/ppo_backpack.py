@@ -256,8 +256,23 @@ class PPOBackpack(PPO):
                                 p.grad = g_actor.detach().clone()
                             else:
                                 p.grad = p.grad + g_actor.detach()
+                    elif isinstance(self.actor_optimizer, ScoreAdam) and not self.use_adam_ablation:
+                        # ScoreAdam + True/Score-Fisher：
+                        # 1) 先对 critic 做 backward，拿到 critic 及共享特征提取器的梯度；
+                        critic_loss.backward()
+                        # 2) 再把基于 per-sample（已裁剪）的 actor 平均梯度 E[g_clip] 加到 actor 参数上；
+                        assert actor_mean_grads_dict is not None
+                        for p in self._actor_params:
+                            pid = id(p)
+                            g_actor = actor_mean_grads_dict.get(pid)
+                            if g_actor is None:
+                                continue
+                            if p.grad is None:
+                                p.grad = g_actor.detach().clone()
+                            else:
+                                p.grad = p.grad + g_actor.detach()
                     else:
-                        # 原始行为：actor + critic 一起 backward，分子来自批量 loss
+                        # 原始行为：actor + critic 一起 backward，分子来自 batch loss
                         actor_loss.backward(retain_graph=True)
                         critic_loss.backward()
 
@@ -420,26 +435,80 @@ class PPOBackpack(PPO):
             loss_sum.backward(retain_graph=True)
 
         # 3) 基于 per-sample 梯度构造二阶矩或均值梯度
+        #    - 非 ablation 模式：对 per-sample 梯度做全局 L2 裁剪，再用裁剪后的 g_clip 构造
+        #      * 分子：E[g_clip]
+        #      * 分母：E[g_clip^2]
+        #    - ablation 模式：保持旧行为（先 E[g]，再裁剪 E[g]，再用 (E[g])^2 作为二阶矩）
         second_moment_dict: dict[int, th.Tensor] = {}
-        actor_mean_grad_dict: Optional[dict[int, th.Tensor]] = {} if self.use_adam_ablation else None
+        actor_mean_grad_dict: Optional[dict[int, th.Tensor]] = {}
 
+        # 收集所有 grad_batch，便于在非 ablation 模式下做 per-sample 全局裁剪
+        per_param_grad_batch: dict[int, th.Tensor] = {}
         for p in self._actor_params:
             if not hasattr(p, "grad_batch"):
                 continue
-            grad_batch: th.Tensor = p.grad_batch  # [batch, *p.shape]
-            pid = id(p)
-            if self.use_adam_ablation:
+            grad_batch = p.grad_batch  # type: ignore[attr-defined]
+            assert isinstance(grad_batch, th.Tensor)
+            per_param_grad_batch[id(p)] = grad_batch
+
+        if not self.use_adam_ablation:
+            # ---------- 非 ablation：per-sample 全局 L2 裁剪 + E[g_clip], E[g_clip^2] ----------
+            if len(per_param_grad_batch) == 0:
+                return second_moment_dict, actor_mean_grad_dict
+
+            any_batch = next(iter(per_param_grad_batch.values()))
+            batch_size = any_batch.shape[0]
+            device = any_batch.device
+            dtype = any_batch.dtype
+
+            # 计算每个样本的全局 L2 范数：sqrt(sum_p ||g_p[j]||^2)
+            total_norm_sq = th.zeros(batch_size, device=device, dtype=dtype)
+            for grad_batch in per_param_grad_batch.values():
+                gb = grad_batch.to(device=device, dtype=dtype)
+                # 使用 reshape 而不是 view，以兼容非 contiguous 的 grad_batch
+                total_norm_sq += gb.reshape(batch_size, -1).pow(2).sum(dim=1)
+            total_norm = th.sqrt(total_norm_sq + 1e-16)
+
+            # 计算每个样本的裁剪系数
+            max_norm = float(self.max_grad_norm)
+            if max_norm > 0.0 and th.isfinite(th.tensor(max_norm, device=device, dtype=dtype)):
+                clip_coef = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)  # [batch]
+            else:
+                clip_coef = th.ones_like(total_norm)
+
+            # 对每个参数的 per-sample 梯度应用裁剪系数
+            clipped_per_param_grad_batch: dict[int, th.Tensor] = {}
+            for pid, grad_batch in per_param_grad_batch.items():
+                gb = grad_batch.to(device=device, dtype=dtype)
+                # 形状广播到 [batch, 1, ..., 1]
+                shape = (batch_size,) + (1,) * (gb.dim() - 1)
+                coef = clip_coef.view(shape)
+                gb_clipped = gb * coef
+                clipped_per_param_grad_batch[pid] = gb_clipped
+
+            # 基于裁剪后的 per-sample 梯度构造 E[g_clip] 和 E[g_clip^2]
+            for p in self._actor_params:
+                pid = id(p)
+                if pid not in clipped_per_param_grad_batch:
+                    continue
+                gb_clipped = clipped_per_param_grad_batch[pid]
+                mean_grad = gb_clipped.mean(dim=0).to(p.dtype)
+                second_moment = gb_clipped.pow(2).mean(dim=0).to(p.dtype)
                 assert actor_mean_grad_dict is not None
-                # 先取 batch 平均梯度 E[g]
+                actor_mean_grad_dict[pid] = mean_grad
+                second_moment_dict[pid] = second_moment
+        else:
+            # ---------- ablation 模式：保持旧行为（E[g] -> clip(E[g]) -> (E[g])^2） ----------
+            assert actor_mean_grad_dict is not None
+            for p in self._actor_params:
+                if not hasattr(p, "grad_batch"):
+                    continue
+                grad_batch = p.grad_batch  # type: ignore[attr-defined]
+                assert isinstance(grad_batch, th.Tensor)
+                pid = id(p)
                 mean_grad = grad_batch.mean(dim=0).to(p.dtype)
                 actor_mean_grad_dict[pid] = mean_grad
-            else:
-                # Fisher / True-Fisher：E[g^2]
-                second_moment = grad_batch.pow(2).mean(dim=0)
-                second_moment_dict[pid] = second_moment.to(p.dtype)
 
-        if self.use_adam_ablation:
-            assert actor_mean_grad_dict is not None
             # 对平均梯度做一次全局 norm 裁剪（模拟标准 Adam/PPO 的行为）
             self._clip_actor_mean_grads(actor_mean_grad_dict)
             # 然后用 (E[g])^2 作为二阶矩估计
