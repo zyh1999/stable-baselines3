@@ -609,9 +609,11 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/ratios_mean", np.mean(ratios))
         if len(batch_advantages) > 0:
             self.logger.record("train/advantages_mean", np.mean(batch_advantages))
+            self.logger.record("train/advantages_std", np.std(batch_advantages))
             self.logger.record("train/advantages_sum", np.sum(batch_advantages))
         if len(batch_norm_advantages) > 0:
             self.logger.record("train/advantages_norm_mean", np.mean(batch_norm_advantages))
+            self.logger.record("train/advantages_norm_std", np.std(batch_norm_advantages))
             self.logger.record("train/advantages_norm_sum", np.sum(batch_norm_advantages))
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))

@@ -81,6 +81,11 @@ class A2C(OnPolicyAlgorithm):
         rollout_buffer_class: Optional[type[RolloutBuffer]] = None,
         rollout_buffer_kwargs: Optional[dict[str, Any]] = None,
         normalize_advantage: bool = False,
+        advantage_multiplier: float = 1.0,
+        normalize_advantage_mean: bool = True,
+        normalize_advantage_std: bool = True,
+        separate_optimizers: bool = False,
+        sep_optim: Optional[bool] = None,
         stats_window_size: int = 100,
         tensorboard_log: Optional[str] = None,
         policy_kwargs: Optional[dict[str, Any]] = None,
@@ -119,6 +124,21 @@ class A2C(OnPolicyAlgorithm):
         )
 
         self.normalize_advantage = normalize_advantage
+        self.advantage_multiplier = advantage_multiplier
+        self.normalize_advantage_mean = normalize_advantage_mean
+        self.normalize_advantage_std = normalize_advantage_std
+
+        # Allow short alias `sep_optim` from hyperparams (overrides `separate_optimizers` when set)
+        if sep_optim is not None:
+            separate_optimizers = sep_optim
+
+        self.separate_optimizers = separate_optimizers
+
+        # Split-optimizer related attributes (mirroring PPO implementation)
+        self.actor_optimizer: Optional[th.optim.Optimizer] = None
+        self.critic_optimizer: Optional[th.optim.Optimizer] = None
+        self._actor_params: Optional[list[th.nn.Parameter]] = None
+        self._critic_params: Optional[list[th.nn.Parameter]] = None
 
         # Update optimizer inside the policy if we want to use RMSProp
         # (original implementation) rather than Adam
@@ -129,6 +149,48 @@ class A2C(OnPolicyAlgorithm):
         if _init_setup_model:
             self._setup_model()
 
+    def _setup_model(self) -> None:
+        super()._setup_model()
+
+        # When requested, build two optimizers with separated parameter groups
+        if self.separate_optimizers:
+            # Helpers to collect unique parameters
+            def _extend_unique(dst: list[th.nn.Parameter], params_iter) -> None:
+                seen = {id(p) for p in dst}
+                for p in params_iter:
+                    if id(p) not in seen:
+                        dst.append(p)
+                        seen.add(id(p))
+
+            actor_params: list[th.nn.Parameter] = []
+            critic_params: list[th.nn.Parameter] = []
+
+            # Actor-specific modules
+            _extend_unique(actor_params, self.policy.mlp_extractor.policy_net.parameters())
+            _extend_unique(actor_params, self.policy.action_net.parameters())
+            if hasattr(self.policy, "log_std") and isinstance(self.policy.log_std, th.nn.Parameter):
+                actor_params.append(self.policy.log_std)
+
+            # Critic-specific modules
+            _extend_unique(critic_params, self.policy.mlp_extractor.value_net.parameters())
+            _extend_unique(critic_params, self.policy.value_net.parameters())
+
+            # Feature extractors: shared or separate
+            if getattr(self.policy, "share_features_extractor", True):
+                _extend_unique(actor_params, self.policy.features_extractor.parameters())
+            else:
+                _extend_unique(actor_params, self.policy.pi_features_extractor.parameters())
+                _extend_unique(critic_params, self.policy.vf_features_extractor.parameters())
+
+            # Save param lists for clipping/logging
+            self._actor_params = actor_params
+            self._critic_params = critic_params
+
+            # Create optimizers mirroring policy optimizer hyperparameters
+            initial_lr = self.lr_schedule(1)
+            self.actor_optimizer = self.policy.optimizer_class(self._actor_params, lr=initial_lr, **self.policy.optimizer_kwargs)  # type: ignore[arg-type]
+            self.critic_optimizer = self.policy.optimizer_class(self._critic_params, lr=initial_lr, **self.policy.optimizer_kwargs)  # type: ignore[arg-type]
+
     def train(self) -> None:
         """
         Update policy using the currently gathered
@@ -138,7 +200,11 @@ class A2C(OnPolicyAlgorithm):
         self.policy.set_training_mode(True)
 
         # Update optimizer learning rate
-        self._update_learning_rate(self.policy.optimizer)
+        if self.separate_optimizers:
+            assert self.actor_optimizer is not None and self.critic_optimizer is not None
+            self._update_learning_rate([self.actor_optimizer, self.critic_optimizer])
+        else:
+            self._update_learning_rate(self.policy.optimizer)
 
         # This will only loop once (get all data in one go)
         for rollout_data in self.rollout_buffer.get(batch_size=None):
@@ -152,8 +218,17 @@ class A2C(OnPolicyAlgorithm):
 
             # Normalize advantage (not present in the original implementation)
             advantages = rollout_data.advantages
-            if self.normalize_advantage:
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            # Normalization does not make sense if batch size == 1
+            if self.normalize_advantage and advantages.numel() > 1:
+                # Apply mean and/or std normalization based on switches.
+                # If both switches are False, keep advantages as-is.
+                if self.normalize_advantage_mean:
+                    advantages = advantages - advantages.mean()
+                if self.normalize_advantage_std:
+                    advantages = advantages / (advantages.std() + 1e-8)
+
+            # Optional: global scaling of the advantage signal
+            advantages = advantages * self.advantage_multiplier
 
             # Policy gradient loss
             policy_loss = -(advantages * log_prob).mean()
@@ -171,12 +246,36 @@ class A2C(OnPolicyAlgorithm):
             loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
 
             # Optimization step
-            self.policy.optimizer.zero_grad()
-            loss.backward()
+            if self.separate_optimizers:
+                assert self.actor_optimizer is not None and self.critic_optimizer is not None
+                assert self._actor_params is not None and self._critic_params is not None
 
-            # Clip grad norm
-            th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            self.policy.optimizer.step()
+                # Zero-grad both optimizers
+                self.actor_optimizer.zero_grad()
+                self.critic_optimizer.zero_grad()
+
+                # Split losses: actor gets policy + entropy, critic gets value loss
+                actor_loss = policy_loss + self.ent_coef * entropy_loss
+                critic_loss = self.vf_coef * value_loss
+
+                # Backward actor then critic (to properly handle shared feature extractors)
+                actor_loss.backward(retain_graph=True)
+                critic_loss.backward()
+
+                # Clip and step actor (includes shared params)
+                th.nn.utils.clip_grad_norm_(self._actor_params, self.max_grad_norm)
+                self.actor_optimizer.step()
+
+                # Clip and step critic (critic-only params)
+                th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm)
+                self.critic_optimizer.step()
+            else:
+                self.policy.optimizer.zero_grad()
+                loss.backward()
+
+                # Clip grad norm
+                th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.policy.optimizer.step()
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
@@ -188,6 +287,15 @@ class A2C(OnPolicyAlgorithm):
         self.logger.record("train/value_loss", value_loss.item())
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
+
+    def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
+        """
+        Include separate optimizers in state dicts when enabled.
+        """
+        if self.separate_optimizers:
+            return ["policy", "policy.optimizer", "actor_optimizer", "critic_optimizer"], []
+        # Default behavior from parent
+        return super()._get_torch_save_params()
 
     def learn(
         self: SelfA2C,
