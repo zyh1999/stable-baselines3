@@ -10,7 +10,7 @@ from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import FloatSchedule, explained_variance
+from stable_baselines3.common.utils import FloatSchedule, explained_variance, obs_as_tensor
 from stable_baselines3.ppo._score_adam import ScoreAdam
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
@@ -84,6 +84,9 @@ class PPO(OnPolicyAlgorithm):
           still exposing per-sample control.
     :param disable_joint_critic_update: 若为 True，则在联合阶段（actor 更新阶段）不更新 critic，
         只保留 critic loss 计算用于日志。需要 separate_optimizers=True 才能真正冻结 critic。
+    :param recompute_advantage_with_current_vf: 若为 True，则在每次 train() 开始时，用“当前 critic”
+        重新计算 rollout_buffer 中的 values/advantages/returns（覆盖采样时存的 values）。
+        这样 actor 的 loss 会使用最新 critic 计算出来的 advantage。
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
     """
 
@@ -127,6 +130,7 @@ class PPO(OnPolicyAlgorithm):
         use_score_fisher: bool = True,
         use_adam_ablation: bool = False,
         disable_joint_critic_update: bool = False,
+        recompute_advantage_with_current_vf: bool = False,
         critic_rollout_multiplier: int = 4,
         critic_warmup_epochs: Optional[int] = None,
         critic_warmup_batch_size: Optional[int] = None,
@@ -202,6 +206,7 @@ class PPO(OnPolicyAlgorithm):
         # 消融开关：让 ScoreAdam 按“普通 Adam”风格工作（分子/分母都基于 batch-mean 梯度）
         self.use_adam_ablation = use_adam_ablation
         self.disable_joint_critic_update = disable_joint_critic_update
+        self.recompute_advantage_with_current_vf = recompute_advantage_with_current_vf
 
         # Split-optimizer related attributes
         self.actor_optimizer: Optional[th.optim.Optimizer] = None
@@ -268,6 +273,10 @@ class PPO(OnPolicyAlgorithm):
         """
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
+
+        # 可选：在训练开始时用当前 critic 重算优势，确保 actor 使用最新 critic
+        if self.recompute_advantage_with_current_vf:
+            self._recompute_rollout_values_and_advantages()
         # Update optimizer learning rate
         if self.separate_optimizers:
             assert self.actor_optimizer is not None and self.critic_optimizer is not None
@@ -565,15 +574,26 @@ class PPO(OnPolicyAlgorithm):
                     critic_loss = self.vf_coef * value_loss
 
                     if isinstance(self.actor_optimizer, ScoreAdam) and self.use_adam_ablation:
-                        critic_loss.backward()
-                        assert actor_mean_grads_dict is not None
-                        for p in self._actor_params:
-                            pid = id(p)
-                            g_actor = actor_mean_grads_dict[pid]
-                            if p.grad is None:
-                                p.grad = g_actor.detach().clone()
-                            else:
-                                p.grad = p.grad + g_actor.detach()
+                        if self.disable_joint_critic_update:
+                            # 冻结 critic：不做 critic backward，只使用 actor 的平均梯度
+                            assert actor_mean_grads_dict is not None
+                            for p in self._actor_params:
+                                pid = id(p)
+                                g_actor = actor_mean_grads_dict[pid]
+                                if p.grad is None:
+                                    p.grad = g_actor.detach().clone()
+                                else:
+                                    p.grad = p.grad + g_actor.detach()
+                        else:
+                            critic_loss.backward()
+                            assert actor_mean_grads_dict is not None
+                            for p in self._actor_params:
+                                pid = id(p)
+                                g_actor = actor_mean_grads_dict[pid]
+                                if p.grad is None:
+                                    p.grad = g_actor.detach().clone()
+                                else:
+                                    p.grad = p.grad + g_actor.detach()
                     else:
                         if self.disable_joint_critic_update:
                             # 只反向 actor，不反向 critic
@@ -680,6 +700,42 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
+
+    def _recompute_rollout_values_and_advantages(self) -> None:
+        """
+        用当前 critic 重新计算 rollout_buffer.values，并据此重算 advantages/returns。
+        需要在 rollout_buffer.get() 之前调用（即 generator_ready=False 时），否则会因展平导致形状不匹配。
+        """
+        assert self.env is not None
+        assert self._last_obs is not None
+        assert self._last_episode_starts is not None
+
+        # 只有在 rollout_buffer 还未展平时才安全
+        if getattr(self.rollout_buffer, "generator_ready", False):
+            # 如果已经展平，直接跳过，避免破坏 buffer（一般不会发生）
+            return
+
+        with th.no_grad():
+            # 1) 重新预测每个 time step 的 V(s_t)
+            obs = self.rollout_buffer.observations
+            if isinstance(obs, dict):
+                flat_obs = {k: self.rollout_buffer.swap_and_flatten(v) for k, v in obs.items()}
+            else:
+                flat_obs = self.rollout_buffer.swap_and_flatten(obs)
+            obs_tensor = obs_as_tensor(flat_obs, self.device)  # type: ignore[arg-type]
+            flat_values = self.policy.predict_values(obs_tensor).flatten()
+
+            values_np = (
+                flat_values.cpu()
+                .numpy()
+                .reshape((self.rollout_buffer.n_envs, self.rollout_buffer.buffer_size))
+                .swapaxes(0, 1)
+            )
+            self.rollout_buffer.values = values_np
+
+            # 2) 用最后一个 observation 预测 last_values，然后重算 GAE/returns
+            last_values = self.policy.predict_values(obs_as_tensor(self._last_obs, self.device))
+            self.rollout_buffer.compute_returns_and_advantage(last_values=last_values, dones=self._last_episode_starts)
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
         """

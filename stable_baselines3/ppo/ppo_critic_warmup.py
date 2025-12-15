@@ -24,7 +24,9 @@ class PPOCriticWarmup(PPO):
       默认 5，和 actor 的 n_epochs 完全分开。
     - critic_warmup_batch_size: critic 预训练阶段 batch 大小，None 时与 batch_size 相同。
     - enable_critic_warmup: 是否启用两阶段流程。默认启用。
-    - disable_joint_critic_update: 是否在联合阶段冻结 critic（只更新 actor）。默认 False。
+    - disable_joint_critic_update: 是否在联合阶段冻结 critic（只更新 actor）。默认 True。
+    - recompute_advantage_with_current_vf: 是否在每次 train() 前用“当前 critic”重算 advantages/returns。
+      默认 True。
     """
 
     def __init__(
@@ -63,6 +65,7 @@ class PPOCriticWarmup(PPO):
         critic_warmup_batch_size: Optional[int] = None,
         enable_critic_warmup: bool = True,
         disable_joint_critic_update: bool = True,
+        recompute_advantage_with_current_vf: bool = True,
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -98,6 +101,7 @@ class PPOCriticWarmup(PPO):
             use_score_fisher=False,  # 不使用 ScoreAdam
             use_adam_ablation=False,
             disable_joint_critic_update=disable_joint_critic_update,
+            recompute_advantage_with_current_vf=recompute_advantage_with_current_vf,
             _init_setup_model=False,  # 我们稍后手动 setup 以便先记录自定义字段
         )
 
@@ -110,6 +114,7 @@ class PPOCriticWarmup(PPO):
         self.critic_warmup_batch_size = critic_warmup_batch_size if critic_warmup_batch_size is not None else self.batch_size
         self.enable_critic_warmup = enable_critic_warmup
         self.disable_joint_critic_update = disable_joint_critic_update
+        self.recompute_advantage_with_current_vf = recompute_advantage_with_current_vf
         if self.enable_critic_warmup and not self.separate_optimizers:
             warnings.warn("critic 预训练需要 `separate_optimizers=True`，已自动关闭该功能。")
             self.enable_critic_warmup = False
@@ -217,11 +222,10 @@ class PPOCriticWarmup(PPO):
                 )
                 if not cont:
                     break
-                # 计入进度并更新 critic
-                self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
+                # 不让 critic rollout 推进 training progress：按 warmup 前的 timesteps 计算进度
+                self._update_current_progress_remaining(timesteps_before_critic, total_timesteps)
                 self._train_critic_only(self.critic_rollout_buffer)
                 # 从全局计数中移除 critic rollout 的步数，使其不影响 progress/日志
-                critic_timesteps = self.num_timesteps - timesteps_before_critic
                 self.num_timesteps = timesteps_before_critic
                 # 也同步回 callback 内部的计时（用于 early stop 等）
                 callback.num_timesteps = self.num_timesteps
