@@ -82,6 +82,8 @@ class PPO(OnPolicyAlgorithm):
           to build E[g].
         - The denominator uses (E[g])^2 as the second-moment estimate, mimicking standard Adam while
           still exposing per-sample control.
+    :param disable_joint_critic_update: 若为 True，则在联合阶段（actor 更新阶段）不更新 critic，
+        只保留 critic loss 计算用于日志。需要 separate_optimizers=True 才能真正冻结 critic。
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
     """
 
@@ -124,6 +126,11 @@ class PPO(OnPolicyAlgorithm):
         separate_optimizers: bool = True,
         use_score_fisher: bool = True,
         use_adam_ablation: bool = False,
+        disable_joint_critic_update: bool = False,
+        critic_rollout_multiplier: int = 4,
+        critic_warmup_epochs: Optional[int] = None,
+        critic_warmup_batch_size: Optional[int] = None,
+        enable_critic_warmup: bool = True,
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -194,6 +201,7 @@ class PPO(OnPolicyAlgorithm):
         self.use_score_fisher = use_score_fisher
         # 消融开关：让 ScoreAdam 按“普通 Adam”风格工作（分子/分母都基于 batch-mean 梯度）
         self.use_adam_ablation = use_adam_ablation
+        self.disable_joint_critic_update = disable_joint_critic_update
 
         # Split-optimizer related attributes
         self.actor_optimizer: Optional[th.optim.Optimizer] = None
@@ -263,7 +271,10 @@ class PPO(OnPolicyAlgorithm):
         # Update optimizer learning rate
         if self.separate_optimizers:
             assert self.actor_optimizer is not None and self.critic_optimizer is not None
-            self._update_learning_rate([self.actor_optimizer, self.critic_optimizer])
+            if self.disable_joint_critic_update:
+                self._update_learning_rate([self.actor_optimizer])
+            else:
+                self._update_learning_rate([self.actor_optimizer, self.critic_optimizer])
         else:
             self._update_learning_rate(self.policy.optimizer)
         # Compute current clip range
@@ -424,7 +435,7 @@ class PPO(OnPolicyAlgorithm):
 
                 entropy_losses.append(entropy_loss.item())
 
-                combined_loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                combined_loss = policy_loss + self.ent_coef * entropy_loss + (0.0 if (self.disable_joint_critic_update and self.separate_optimizers) else self.vf_coef * value_loss)
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -550,15 +561,11 @@ class PPO(OnPolicyAlgorithm):
                     self.actor_optimizer.zero_grad()
                     self.critic_optimizer.zero_grad()
 
-                    # Backward actor then critic
                     actor_loss = policy_loss + self.ent_coef * entropy_loss
                     critic_loss = self.vf_coef * value_loss
 
                     if isinstance(self.actor_optimizer, ScoreAdam) and self.use_adam_ablation:
-                        # 普通 Adam 消融版本：
-                        # 1) 先对 critic 做 backward，拿到 critic 及共享特征提取器的梯度；
                         critic_loss.backward()
-                        # 2) 再把基于 per-sample 的 actor 平均梯度 E[g] 加到 actor 参数（含共享特征）上；
                         assert actor_mean_grads_dict is not None
                         for p in self._actor_params:
                             pid = id(p)
@@ -568,32 +575,34 @@ class PPO(OnPolicyAlgorithm):
                             else:
                                 p.grad = p.grad + g_actor.detach()
                     else:
-                        # 原始行为：actor + critic 一起 backward，分子来自批量 loss
-                        actor_loss.backward(retain_graph=True)
-                        critic_loss.backward()
+                        if self.disable_joint_critic_update:
+                            # 只反向 actor，不反向 critic
+                            actor_loss.backward()
+                        else:
+                            actor_loss.backward(retain_graph=True)
+                            critic_loss.backward()
 
-                    # Clip and step actor (includes shared params)
+                    # Clip and step actor
                     actor_grad_norms.append(
                         th.nn.utils.clip_grad_norm_(self._actor_params, self.max_grad_norm).cpu().numpy()
                     )
                     if isinstance(self.actor_optimizer, ScoreAdam):
-                        # Pass score-only gradients so that the denominator in Adam
-                        # only depends on score-related terms, not on the advantage.
                         self.actor_optimizer.step(score_grads=score_grads_dict)
                     else:
                         self.actor_optimizer.step()
 
-                    # Clip and step critic (critic-only params)
-                    critic_grad_norms.append(
-                        th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm).cpu().numpy()
-                    )
-                    self.critic_optimizer.step()
+                    if not self.disable_joint_critic_update:
+                        critic_grad_norms.append(
+                            th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm).cpu().numpy()
+                        )
+                        self.critic_optimizer.step()
                     # For compatibility with later logging
                     loss = combined_loss
                 else:
+                    if self.disable_joint_critic_update and self.verbose >= 1:
+                        warnings.warn("disable_joint_critic_update 在 separate_optimizers=False 时无效，将更新 actor+critic。")
                     self.policy.optimizer.zero_grad()
                     combined_loss.backward()
-                    # Clip grad norm
                     grad_norms.append(
                         th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm).cpu().numpy()
                     )
