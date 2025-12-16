@@ -12,6 +12,7 @@ from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticP
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import FloatSchedule, explained_variance, obs_as_tensor
 from stable_baselines3.ppo._score_adam import ScoreAdam
+from stable_baselines3.ppo._clip_fraction_traces import ClipFractionTraceConfig, ClipFractionTraceLogger
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
 
@@ -87,6 +88,8 @@ class PPO(OnPolicyAlgorithm):
     :param recompute_advantage_with_current_vf: 若为 True，则在每次 train() 开始时，用“当前 critic”
         重新计算 rollout_buffer 中的 values/advantages/returns（覆盖采样时存的 values）。
         这样 actor 的 loss 会使用最新 critic 计算出来的 advantage。
+    :param clip_fraction_trace_dir: 输出 clip fraction 曲线的目录（None 表示关闭该统计）。
+    :param clip_fraction_trace_plot_every_steps: 大约每隔多少 global_step 输出一次（默认 1e5）。
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
     """
 
@@ -131,6 +134,8 @@ class PPO(OnPolicyAlgorithm):
         use_adam_ablation: bool = False,
         disable_joint_critic_update: bool = False,
         recompute_advantage_with_current_vf: bool = False,
+        clip_fraction_trace_dir: Optional[str] = None,
+        clip_fraction_trace_plot_every_steps: int = 100_000,
         critic_rollout_multiplier: int = 4,
         critic_warmup_epochs: Optional[int] = None,
         critic_warmup_batch_size: Optional[int] = None,
@@ -207,6 +212,11 @@ class PPO(OnPolicyAlgorithm):
         self.use_adam_ablation = use_adam_ablation
         self.disable_joint_critic_update = disable_joint_critic_update
         self.recompute_advantage_with_current_vf = recompute_advantage_with_current_vf
+        self._clip_fraction_trace: Optional[ClipFractionTraceLogger] = None
+        if clip_fraction_trace_dir is not None:
+            self._clip_fraction_trace = ClipFractionTraceLogger(
+                ClipFractionTraceConfig(out_dir=clip_fraction_trace_dir, plot_every_steps=clip_fraction_trace_plot_every_steps)
+            )
 
         # Split-optimizer related attributes
         self.actor_optimizer: Optional[th.optim.Optimizer] = None
@@ -277,6 +287,10 @@ class PPO(OnPolicyAlgorithm):
         # 可选：在训练开始时用当前 critic 重算优势，确保 actor 使用最新 critic
         if self.recompute_advantage_with_current_vf:
             self._recompute_rollout_values_and_advantages()
+
+        # 可选：开始记录本轮 rollout 的 clip fraction 曲线
+        if self._clip_fraction_trace is not None:
+            self._clip_fraction_trace.start_rollout(global_step=int(self.num_timesteps))
         # Update optimizer learning rate
         if self.separate_optimizers:
             assert self.actor_optimizer is not None and self.critic_optimizer is not None
@@ -334,6 +348,12 @@ class PPO(OnPolicyAlgorithm):
                     # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
 
+                # 用于“adv-mean 后符号翻转”的判断：仅考虑减均值前后符号变化（不含 std 归一化）
+                advantages_raw = rollout_data.advantages
+                advantages_meaned = advantages_raw
+                if self.normalize_advantage and len(advantages_raw) > 1 and self.normalize_advantage_mean:
+                    advantages_meaned = advantages_raw - advantages_raw.mean()
+
                 values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values = values.flatten()
                 # Normalize advantage
@@ -367,6 +387,32 @@ class PPO(OnPolicyAlgorithm):
                     # (for each sample). Wherever policy_loss_2 < policy_loss_1, the clipped
                     # objective is active.
                     use_clipped_mask = policy_loss_2 < policy_loss_1
+                    # 统计：按 minibatch 序号记录 3 条 clip fraction 曲线（overall / flip-only / nonflip-only）
+                    if self._clip_fraction_trace is not None and self.normalize_advantage_mean:
+                        clipped_mask = (th.abs(ratio - 1) > clip_range)
+                        overall_cf = clipped_mask.float().mean().item()
+
+                        sign_flip = ((advantages_raw > 0) & (advantages_meaned < 0)) | (
+                            (advantages_raw < 0) & (advantages_meaned > 0)
+                        )
+                        flip_count = int(sign_flip.sum().item())
+                        nonflip_count = int((~sign_flip).sum().item())
+
+                        if flip_count > 0:
+                            flip_cf = clipped_mask[sign_flip].float().mean().item()
+                        else:
+                            flip_cf = float("nan")
+
+                        if nonflip_count > 0:
+                            nonflip_cf = clipped_mask[~sign_flip].float().mean().item()
+                        else:
+                            nonflip_cf = float("nan")
+
+                        self._clip_fraction_trace.add_minibatch_point(
+                            overall_clip_fraction=overall_cf,
+                            flip_clip_fraction=flip_cf,
+                            nonflip_clip_fraction=nonflip_cf,
+                        )
 
                 # Logging
                 pg_losses.append(policy_loss.item())
@@ -631,6 +677,10 @@ class PPO(OnPolicyAlgorithm):
             self._n_updates += 1
             if not continue_training:
                 break
+
+        # 可选：输出本轮 rollout 的曲线
+        if self._clip_fraction_trace is not None:
+            self._clip_fraction_trace.finish_rollout()
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
