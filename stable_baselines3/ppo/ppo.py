@@ -90,6 +90,8 @@ class PPO(OnPolicyAlgorithm):
         这样 actor 的 loss 会使用最新 critic 计算出来的 advantage。
     :param clip_fraction_trace_dir: 输出 clip fraction 曲线的目录（None 表示关闭该统计）。
     :param clip_fraction_trace_plot_every_steps: 大约每隔多少 global_step 输出一次（默认 1e5）。
+    :param adv_loss_remove_ratio: 若为 True，则 PPO surrogate 中仅用 ratio 构造 clip mask，
+        但对最终 min(...) 的结果再除以 ratio，让“真 loss”更接近只依赖 advantage 的形状。
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
     """
 
@@ -140,6 +142,7 @@ class PPO(OnPolicyAlgorithm):
         critic_warmup_epochs: Optional[int] = None,
         critic_warmup_batch_size: Optional[int] = None,
         enable_critic_warmup: bool = True,
+        adv_loss_remove_ratio: bool = False,
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -212,6 +215,9 @@ class PPO(OnPolicyAlgorithm):
         self.use_adam_ablation = use_adam_ablation
         self.disable_joint_critic_update = disable_joint_critic_update
         self.recompute_advantage_with_current_vf = recompute_advantage_with_current_vf
+        # 若为 True：用带 ratio 的 surrogate 判定 clip mask，但对 min(...) 再除以 ratio，
+        # 使真正参与梯度更新的策略 loss 更接近只依赖 advantage 的形状
+        self.adv_loss_remove_ratio = adv_loss_remove_ratio
         self._clip_fraction_trace: Optional[ClipFractionTraceLogger] = None
         if clip_fraction_trace_dir is not None:
             self._clip_fraction_trace = ClipFractionTraceLogger(
@@ -374,10 +380,17 @@ class PPO(OnPolicyAlgorithm):
                 # ratio between old and new policy, should be one at the first iteration
                 ratio = th.exp(log_prob - rollout_data.old_log_prob)
                 ratios.append(ratio.detach().cpu().numpy())
-                # clipped surrogate loss
+                # clipped surrogate loss（用于 clip mask 和“真 loss”）
                 policy_loss_1 = advantages * ratio
                 policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
-                policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+                # 原始 PPO surrogate（带 ratio）
+                ppo_surrogate = th.min(policy_loss_1, policy_loss_2)
+                # 可选：在最终 loss 中“移除 ratio”，只保留通过 mask 选出来的优势方向
+                if self.adv_loss_remove_ratio:
+                    ppo_surrogate_for_actor = ppo_surrogate / (ratio + 1e-8)
+                else:
+                    ppo_surrogate_for_actor = ppo_surrogate
+                policy_loss = -ppo_surrogate_for_actor.mean()
 
                 # For score-only loss used by ScoreAdam, we need to know which samples are
                 # clipped according to the *original* PPO objective (that depends on advantage
@@ -528,6 +541,7 @@ class PPO(OnPolicyAlgorithm):
                     if self.use_adam_ablation:
                         # Adam 消融 & true-Fisher 都使用真实 actor loss（policy + entropy）
                         # 这里只是先构造逐样本的 actor loss，后续根据 use_adam_ablation 决定如何聚合梯度
+                        # 这里保持“旧行为”：使用带 ratio 的标准 PPO surrogate
                         policy_loss_per_sample = -th.min(policy_loss_1, policy_loss_2)  # [batch]
                         if entropy is None:
                             # 与上面 entropy_loss = -mean(-log_prob) 对应：逐样本为 log_prob
@@ -548,6 +562,7 @@ class PPO(OnPolicyAlgorithm):
                         per_sample_loss = -score_objective
                     else:
                         # True-Fisher：基于真实 actor loss（policy + entropy）的逐样本 loss，用于构造 E[g^2]
+                        # 这里保持“旧行为”：使用带 ratio 的标准 PPO surrogate
                         policy_loss_per_sample = -th.min(policy_loss_1, policy_loss_2)  # [batch]
                         if entropy is None:
                             entropy_loss_per_sample = -(-log_prob)  # = log_prob
