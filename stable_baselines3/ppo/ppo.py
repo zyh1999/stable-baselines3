@@ -387,7 +387,7 @@ class PPO(OnPolicyAlgorithm):
                 ppo_surrogate = th.min(policy_loss_1, policy_loss_2)
                 # 可选：在最终 loss 中“移除 ratio”，只保留通过 mask 选出来的优势方向
                 if self.adv_loss_remove_ratio:
-                    ppo_surrogate_for_actor = ppo_surrogate / (ratio + 1e-8)
+                    ppo_surrogate_for_actor = ppo_surrogate / (ratio.detach() + 1e-8)
                 else:
                     ppo_surrogate_for_actor = ppo_surrogate
                 policy_loss = -ppo_surrogate_for_actor.mean()
