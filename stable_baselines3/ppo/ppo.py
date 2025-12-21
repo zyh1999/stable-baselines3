@@ -143,6 +143,7 @@ class PPO(OnPolicyAlgorithm):
         critic_warmup_batch_size: Optional[int] = None,
         enable_critic_warmup: bool = True,
         adv_loss_remove_ratio: bool = False,
+        adv_loss_invert_ratio: bool = False,
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -218,6 +219,9 @@ class PPO(OnPolicyAlgorithm):
         # 若为 True：用带 ratio 的 surrogate 判定 clip mask，但对 min(...) 再除以 ratio，
         # 使真正参与梯度更新的策略 loss 更接近只依赖 advantage 的形状
         self.adv_loss_remove_ratio = adv_loss_remove_ratio
+        # 若为 True：用带 ratio 的 surrogate 判定 clip mask，但对 min(...) 再除以 ratio^2，
+        # 模拟 "Swap Positive" 或 "倒数 ratio" 的效果 (L ~ A/ratio)
+        self.adv_loss_invert_ratio = adv_loss_invert_ratio
         self._clip_fraction_trace: Optional[ClipFractionTraceLogger] = None
         if clip_fraction_trace_dir is not None:
             self._clip_fraction_trace = ClipFractionTraceLogger(
@@ -385,9 +389,16 @@ class PPO(OnPolicyAlgorithm):
                 policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
                 # 原始 PPO surrogate（带 ratio）
                 ppo_surrogate = th.min(policy_loss_1, policy_loss_2)
-                # 可选：在最终 loss 中“移除 ratio”，只保留通过 mask 选出来的优势方向
-                if self.adv_loss_remove_ratio:
-                    ppo_surrogate_for_actor = ppo_surrogate / (ratio.detach() + 1e-8)
+                # 可选：对最终 loss 做 trick
+                # 1. adv_loss_remove_ratio: 除以 ratio，变为 VPG 梯度
+                # 2. adv_loss_invert_ratio: 除以 ratio^2，变为 1/ratio 梯度 (Inverse Ratio)
+                # 3. 默认: 保持原样
+                if self.adv_loss_invert_ratio:
+                    # L' ~ L / ratio^2 ~ (-A * ratio) / ratio^2 ~ -A / ratio
+                    ppo_surrogate_for_actor = ppo_surrogate / (ratio.detach().pow(2) )
+                elif self.adv_loss_remove_ratio:
+                    # L' ~ L / ratio ~ (-A * ratio) / ratio ~ -A
+                    ppo_surrogate_for_actor = ppo_surrogate / (ratio.detach() )
                 else:
                     ppo_surrogate_for_actor = ppo_surrogate
                 policy_loss = -ppo_surrogate_for_actor.mean()
