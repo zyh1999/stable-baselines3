@@ -144,6 +144,7 @@ class PPO(OnPolicyAlgorithm):
         enable_critic_warmup: bool = True,
         adv_loss_remove_ratio: bool = False,
         adv_loss_invert_ratio: bool = False,
+        adv_loss_soft_clip: bool = False,
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -222,6 +223,8 @@ class PPO(OnPolicyAlgorithm):
         # 若为 True：用带 ratio 的 surrogate 判定 clip mask，但对 min(...) 再除以 ratio^2，
         # 模拟 "Swap Positive" 或 "倒数 ratio" 的效果 (L ~ A/ratio)
         self.adv_loss_invert_ratio = adv_loss_invert_ratio
+        # 若为 True：使用 Soft Clip (Polynomial Decay)，让更新幅度在 clip 边界处平滑归零，无硬截断
+        self.adv_loss_soft_clip = adv_loss_soft_clip
         self._clip_fraction_trace: Optional[ClipFractionTraceLogger] = None
         if clip_fraction_trace_dir is not None:
             self._clip_fraction_trace = ClipFractionTraceLogger(
@@ -391,14 +394,45 @@ class PPO(OnPolicyAlgorithm):
                 ppo_surrogate = th.min(policy_loss_1, policy_loss_2)
                 # 可选：对最终 loss 做 trick
                 # 1. adv_loss_remove_ratio: 除以 ratio，变为 VPG 梯度
-                # 2. adv_loss_invert_ratio: 除以 ratio^2，变为 1/ratio 梯度 (Inverse Ratio)
-                # 3. 默认: 保持原样
+                # 2. adv_loss_invert_ratio: 仅在 Adv>0 时除以 ratio^2 (模拟 Swap Positive)，Adv<=0 保持原样
+                # 3. adv_loss_soft_clip: Soft Clip (Polynomial Decay), 梯度在边界处归零
                 if self.adv_loss_invert_ratio:
-                    # L' ~ L / ratio^2 ~ (-A * ratio) / ratio^2 ~ -A / ratio
-                    ppo_surrogate_for_actor = ppo_surrogate / (ratio.detach().pow(2) )
+                    # Positive Adv: L' ~ L / ratio^2 ~ -A / ratio (梯度衰减)
+                    # Negative Adv: 保持 PPO 原样 (-A * clip(ratio))
+                    # 构造一个系数因子：Adv>0 时为 1/ratio^2，Adv<=0 时为 1.0
+                    inv_factor = th.where(
+                        advantages > 0,
+                        1.0 / (ratio.detach().pow(2) ),
+                        th.ones_like(ratio)
+                    )
+                    ppo_surrogate_for_actor = ppo_surrogate * inv_factor
                 elif self.adv_loss_remove_ratio:
                     # L' ~ L / ratio ~ (-A * ratio) / ratio ~ -A
                     ppo_surrogate_for_actor = ppo_surrogate / (ratio.detach() )
+                elif self.adv_loss_soft_clip:
+                    # Soft Clip (Polynomial Decay)
+                    # 保留 ratio 方向 (VPG基底)，但在接近 clip 边界时系数衰减至 0
+                    eps = clip_range
+                    
+                    # 归一化距离 t:
+                    # 单边 Soft Clip:
+                    # A > 0: 只限制 r > 1 的部分 (t_pos)，r < 1 时 t=0 (不 decay)
+                    # A < 0: 只限制 r < 1 的部分 (t_neg)，r > 1 时 t=0 (不 decay)
+                    t_pos = th.clamp((ratio - 1.0) / (eps + 1e-8), min=0.0) # r < 1 -> neg -> 0
+                    t_neg = th.clamp((1.0 - ratio) / (eps + 1e-8), min=0.0) # r > 1 -> neg -> 0
+                    
+                    # 距离归一化到 [0, 1] 范围用于 decay 计算 (超过 1 的部分也会被 decay 到 0)
+                    t_pos = th.clamp(t_pos, max=1.0)
+                    t_neg = th.clamp(t_neg, max=1.0)
+
+                    t = th.where(advantages >= 0, t_pos, t_neg)
+                    
+                    p = 2.0
+                    w_det = ((1.0 - t) ** p).detach()
+                    
+                    # 作用于 PPO Surrogate，并除以 ratio，使得 Loss 形式回归到 -Adv * w(r)
+                    # 这样在 r=1 时，Loss = -Adv (VPG形式)；在边界处，Loss = 0
+                    ppo_surrogate_for_actor = ppo_surrogate * w_det / (ratio.detach() )
                 else:
                     ppo_surrogate_for_actor = ppo_surrogate
                 policy_loss = -ppo_surrogate_for_actor.mean()
