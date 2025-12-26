@@ -60,6 +60,7 @@ class PPOAdvDecouple(PPO):
         clip_mask_use_adv_mean: Optional[bool] = None,
         loss_use_adv_mean: Optional[bool] = None,
         loss_use_adv_std: Optional[bool] = None,
+        slow_critic_update_interval: int = 1,
         _init_setup_model: bool = True,
         **kwargs: Any,
     ):
@@ -105,6 +106,8 @@ class PPOAdvDecouple(PPO):
         self.loss_use_adv_mean = self.normalize_advantage_mean if loss_use_adv_mean is None else loss_use_adv_mean
         self.loss_use_adv_std = self.normalize_advantage_std if loss_use_adv_std is None else loss_use_adv_std
         self.clip_mask_use_adv_mean = self.loss_use_adv_mean if clip_mask_use_adv_mean is None else clip_mask_use_adv_mean
+        self.slow_critic_update_interval = slow_critic_update_interval
+
 
         if _init_setup_model:
             self._setup_model()
@@ -269,18 +272,29 @@ class PPOAdvDecouple(PPO):
                     actor_loss = policy_loss + self.ent_coef * entropy_loss
                     critic_loss = self.vf_coef * value_loss
 
-                    actor_loss.backward(retain_graph=True)
-                    critic_loss.backward()
+                    # Check if we should update critic in this epoch
+                    update_critic = (self._n_updates % self.slow_critic_update_interval) == 0
+
+                    if update_critic:
+                        # If updating critic, we need retain_graph=True for actor backward
+                        # because critic backward will use the same graph (if shared features)
+                        actor_loss.backward(retain_graph=True)
+                        critic_loss.backward()
+                    else:
+                        # If NOT updating critic, no need to retain graph
+                        actor_loss.backward()
 
                     actor_grad_norms.append(
                         th.nn.utils.clip_grad_norm_(self._actor_params, self.max_grad_norm).cpu().numpy()
                     )
                     self.actor_optimizer.step()
 
-                    critic_grad_norms.append(
-                        th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm).cpu().numpy()
-                    )
-                    self.critic_optimizer.step()
+                    if update_critic:
+                        critic_grad_norms.append(
+                            th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm).cpu().numpy()
+                        )
+                        self.critic_optimizer.step()
+                    
                     loss = combined_loss
                 else:
                     self.policy.optimizer.zero_grad()
