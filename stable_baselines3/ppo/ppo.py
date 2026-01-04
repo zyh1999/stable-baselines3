@@ -12,6 +12,7 @@ from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticP
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import FloatSchedule, explained_variance, obs_as_tensor
 from stable_baselines3.ppo._score_adam import ScoreAdam
+from stable_baselines3.ppo.ppo_analysis_plugin import PPOAnalysisPlugin
 from stable_baselines3.ppo._clip_fraction_traces import ClipFractionTraceConfig, ClipFractionTraceLogger
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
@@ -145,6 +146,7 @@ class PPO(OnPolicyAlgorithm):
         adv_loss_remove_ratio: bool = False,
         adv_loss_invert_ratio: bool = False,
         adv_loss_soft_clip: bool = False,
+        enable_adv_mean_flip_grad_analysis: bool = False,
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -225,6 +227,8 @@ class PPO(OnPolicyAlgorithm):
         self.adv_loss_invert_ratio = adv_loss_invert_ratio
         # 若为 True：使用 Soft Clip (Polynomial Decay)，让更新幅度在 clip 边界处平滑归零，无硬截断
         self.adv_loss_soft_clip = adv_loss_soft_clip
+        # 若为 True：开启 Advantage Mean 相关的梯度占比(翻转/Clip变化)分析（计算开销较大）
+        self.enable_adv_mean_flip_grad_analysis = enable_adv_mean_flip_grad_analysis
         self._clip_fraction_trace: Optional[ClipFractionTraceLogger] = None
         if clip_fraction_trace_dir is not None:
             self._clip_fraction_trace = ClipFractionTraceLogger(
@@ -525,6 +529,20 @@ class PPO(OnPolicyAlgorithm):
                             # Calculate clip fraction for samples in this percentile range
                             fraction = clipped_batch[indices].mean().item()
                             storage.append(fraction)
+
+                # ==============================================================================
+                # New Analysis: Gradient Contribution & Clip Shift Analysis (for adv mean ablation)
+                # Refactored to Plugin (Enabled via flag)
+                # ==============================================================================
+                if self.enable_adv_mean_flip_grad_analysis:
+                    PPOAnalysisPlugin.run_analysis(
+                        ppo_instance=self,
+                        advantages_raw=advantages_raw,
+                        advantages_meaned=advantages_meaned,
+                        ratio=ratio,
+                        clip_range=clip_range,
+                        ppo_surrogate_for_actor=ppo_surrogate_for_actor
+                    )
 
                 if self.clip_range_vf is None:
                     # No clipping
