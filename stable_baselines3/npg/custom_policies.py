@@ -90,6 +90,19 @@ class NPGActorCriticPolicy(ActorCriticPolicy):
             return self.action_dist.proba_distribution(mean_actions, log_std)
         return super()._get_action_dist_from_latent(latent_pi)
 
+    def forward(self, obs: th.Tensor, deterministic: bool = False):  # type: ignore[override]
+        """
+        Important (PopArt):
+        - SB3's ActorCriticPolicy.forward() returns the *raw* value head output.
+        - When value_net is PopArt, that raw output is the *normalized* value prediction.
+        - Detach-style runners/GAE expect unnormalized values in env-reward scale.
+        So we unnormalize here to make rollout buffer values consistent with rewards/returns.
+        """
+        actions, values, log_prob = super().forward(obs, deterministic=deterministic)
+        if self.use_popart and isinstance(self.value_net, PopArt):
+            values = self.value_net.unnormalize(values)
+        return actions, values, log_prob
+
     def predict_values(self, obs: th.Tensor) -> th.Tensor:  # type: ignore[override]
         values = super().predict_values(obs)
         if self.use_popart and isinstance(self.value_net, PopArt):
