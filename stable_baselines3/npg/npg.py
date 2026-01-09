@@ -134,13 +134,33 @@ class NPG(OnPolicyAlgorithm):
         device: th.device | str = "auto",
         _init_setup_model: bool = True,
     ):
-        # Using SB3 default policies: do NOT inject custom kwargs (would break ActorCriticPolicy signature).
-        # If you want PopArt, pass the custom policy explicitly (see `stable_baselines3.npg.custom_policies`).
+        # PopArt requires a custom value head (see `stable_baselines3.npg.custom_policies.NPGActorCriticPolicy`).
+        # To make it easier to use from RL-ZOO configs, we auto-switch the default policies when use_popart=True.
         if use_popart:
-            raise ValueError(
-                "use_popart=True requires a custom policy. "
-                "Please pass `stable_baselines3.npg.custom_policies.NPGActorCriticPolicy` as the `policy` argument."
-            )
+            # Lazy import to avoid any potential circular imports at module import time.
+            from stable_baselines3.npg.custom_policies import NPGActorCriticPolicy
+
+            # RL-ZOO config commonly passes policy="MlpPolicy" (string). In that case, we override to the custom policy.
+            # We also override if a default SB3 ActorCriticPolicy class/alias was passed directly.
+            is_default_policy = False
+            if isinstance(policy, str):
+                is_default_policy = policy in self.policy_aliases
+            else:
+                is_default_policy = policy in {ActorCriticPolicy, MlpPolicy, CnnPolicy, MultiInputPolicy}
+
+            if is_default_policy:
+                if verbose > 0:
+                    print(
+                        "[NPG] use_popart=True: overriding `policy` to "
+                        "`stable_baselines3.npg.custom_policies.NPGActorCriticPolicy`"
+                    )
+                policy = NPGActorCriticPolicy
+
+            # Ensure the custom policy receives the flag; safe because we only inject when use_popart=True.
+            policy_kwargs = {} if policy_kwargs is None else dict(policy_kwargs)
+            if "use_popart" in policy_kwargs and bool(policy_kwargs["use_popart"]) is not True:
+                raise ValueError("Got use_popart=True but policy_kwargs['use_popart'] is False.")
+            policy_kwargs["use_popart"] = True
 
         super().__init__(
             policy,
