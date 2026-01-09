@@ -134,10 +134,13 @@ class NPG(OnPolicyAlgorithm):
         device: th.device | str = "auto",
         _init_setup_model: bool = True,
     ):
-        # Inject use_popart into policy_kwargs so policy builds the right layer
-        if policy_kwargs is None:
-            policy_kwargs = {}
-        policy_kwargs["use_popart"] = use_popart
+        # Using SB3 default policies: do NOT inject custom kwargs (would break ActorCriticPolicy signature).
+        # If you want PopArt, pass the custom policy explicitly (see `stable_baselines3.npg.custom_policies`).
+        if use_popart:
+            raise ValueError(
+                "use_popart=True requires a custom policy. "
+                "Please pass `stable_baselines3.npg.custom_policies.NPGActorCriticPolicy` as the `policy` argument."
+            )
 
         super().__init__(
             policy,
@@ -207,7 +210,11 @@ class NPG(OnPolicyAlgorithm):
         rollout_buffer: RolloutBuffer,
         n_rollout_steps: int,
     ) -> bool:
-        return collect_rollouts_npg(self, env, callback, rollout_buffer, n_rollout_steps)
+        # Use the custom rollout logic when we need detach-style action squashing and/or PopArt alignment.
+        # Otherwise, fall back to SB3 built-in rollout collection to keep behavior standard.
+        if getattr(self, "use_popart", False) or getattr(self, "action_squash", False):
+            return collect_rollouts_npg(self, env, callback, rollout_buffer, n_rollout_steps)
+        return super().collect_rollouts(env, callback, rollout_buffer, n_rollout_steps)
 
     def predict(
         self,
@@ -515,26 +522,25 @@ class NPG(OnPolicyAlgorithm):
 
         for _ in range(self.v_epochs):
             for rollout_data in self.rollout_buffer.get(self.v_batch_size):
-                # Calculate normalized target values for PopArt
-                target_values = rollout_data.returns
+                target_values = rollout_data.returns.view(-1, 1)
                 if self.use_popart:
-                    # Target is normalized return
+                    # PopArt 路径：保留“层层显式”计算（用于对齐/调试）
                     with th.no_grad():
-                        target_values = self.policy.value_net.normalize(target_values.view(-1, 1))
-                else:
-                    target_values = target_values.view(-1, 1)
-                
-                # Get normalized predicted values
-                features = self.policy.extract_features(rollout_data.observations)
-                if self.policy.share_features_extractor:
-                    latent_vf = self.policy.mlp_extractor.forward_critic(features)
-                else:
-                    pi_features, vf_features = features
-                    latent_vf = self.policy.mlp_extractor.forward_critic(vf_features)
-                
-                values_pred = self.policy.value_net(latent_vf)  # normalized value if PopArt else real value
+                        target_values = self.policy.value_net.normalize(target_values)
 
-                value_loss = F.mse_loss(values_pred, target_values)
+                    features = self.policy.extract_features(rollout_data.observations)
+                    if self.policy.share_features_extractor:
+                        latent_vf = self.policy.mlp_extractor.forward_critic(features)
+                    else:
+                        pi_features, vf_features = features
+                        latent_vf = self.policy.mlp_extractor.forward_critic(vf_features)
+
+                    values_pred = self.policy.value_net(latent_vf)  # normalized value
+                    value_loss = F.mse_loss(values_pred, target_values)
+                else:
+                    # 非 PopArt：走 SB3 原生路径，不再手动拆网络结构
+                    values_pred = self.policy.predict_values(rollout_data.observations)
+                    value_loss = F.mse_loss(values_pred, target_values)
                 value_losses.append(value_loss.item())
 
                 self.critic_optimizer.zero_grad()
