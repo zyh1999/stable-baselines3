@@ -134,8 +134,8 @@ class NPG(OnPolicyAlgorithm):
         seed: int | None = None,
         device: th.device | str = "auto",
         use_detach_obs_rms: bool = False,
-        detach_obs_rms_eps: float = 1e-8,
-        detach_obs_rms_clip: float | None = None,
+        detach_obs_rms_eps: float = 1e-5,
+        detach_obs_rms_clip: float | None = 5.0,
         detach_recompute_pi_old: bool = True,
         _init_setup_model: bool = True,
     ):
