@@ -31,6 +31,7 @@ from torch.nn import functional as F
 from sb3_contrib.common.utils import flat_grad
 from stable_baselines3.npg.policies import CnnPolicy, MlpPolicy, MultiInputPolicy
 from stable_baselines3.npg.rollout import collect_rollouts_npg
+from stable_baselines3.npg.obs_norm import DetachObsNormConfig, DetachObsRMS
 
 
 def conjugate_gradient(fn_fvp, g, nsteps=10, residual_tol=1e-10):
@@ -132,6 +133,10 @@ class NPG(OnPolicyAlgorithm):
         verbose: int = 0,
         seed: int | None = None,
         device: th.device | str = "auto",
+        use_detach_obs_rms: bool = False,
+        detach_obs_rms_eps: float = 1e-8,
+        detach_obs_rms_clip: float | None = None,
+        detach_recompute_pi_old: bool = True,
         _init_setup_model: bool = True,
     ):
         # PopArt requires a custom value head (see `stable_baselines3.npg.custom_policies.NPGActorCriticPolicy`).
@@ -220,6 +225,13 @@ class NPG(OnPolicyAlgorithm):
         self.debug_nan = debug_nan
         self.kl_ref = kl_ref
 
+        # Detach-style obs normalization (mingfei):
+        self.use_detach_obs_rms = use_detach_obs_rms
+        self._detach_obs_norm_cfg = DetachObsNormConfig(
+            eps=detach_obs_rms_eps, clip=detach_obs_rms_clip, recompute_pi_old=detach_recompute_pi_old
+        )
+        self._obs_norm: DetachObsRMS | None = None
+
         if _init_setup_model:
             self._setup_model()
 
@@ -255,6 +267,8 @@ class NPG(OnPolicyAlgorithm):
         # Replicate the relevant parts of BasePolicy.predict() but without the Box-action pre-clip,
         # so we can apply tanh squashing on the raw action (detach style).
         self.policy.set_training_mode(False)
+        if self._obs_norm is not None and isinstance(observation, np.ndarray):
+            observation = self._obs_norm.normalize_np(observation)
         obs_tensor, vectorized_env = self.policy.obs_to_tensor(observation)
         with th.no_grad():
             raw_actions = self.policy._predict(obs_tensor, deterministic=deterministic)
@@ -281,6 +295,8 @@ class NPG(OnPolicyAlgorithm):
 
     def _setup_model(self) -> None:
         super()._setup_model()
+        if self.use_detach_obs_rms:
+            self._obs_norm = DetachObsRMS(self.observation_space, self.device, self._detach_obs_norm_cfg)
         # Basic sanity checks similar to TRPO
         if self.env is not None:
             buffer_size = self.env.num_envs * self.n_steps
@@ -391,6 +407,10 @@ class NPG(OnPolicyAlgorithm):
         kl_divergences = []
         value_losses = []
 
+        # Detach-style: update obs RMS stats with current rollout observations BEFORE training.
+        if self._obs_norm is not None:
+            self._obs_norm.update_from_rollout_buffer(self.rollout_buffer)
+
         # PopArt (detach 对齐): update running stats with current rollout returns BEFORE actor/critic updates.
         # Important: use shape [N, 1] to match PopArt(norm_axes=1) broadcasting semantics.
         if self.use_popart:
@@ -424,6 +444,10 @@ class NPG(OnPolicyAlgorithm):
                         rollout_data.returns[:: self.sub_sampling_factor],
                     )
 
+                obs_t = rollout_data.observations
+                if self._obs_norm is not None:
+                    obs_t = self._obs_norm.normalize_tensor(obs_t)
+
                 actions = rollout_data.actions
                 if isinstance(self.action_space, spaces.Discrete):
                     actions = rollout_data.actions.long().flatten()
@@ -433,11 +457,11 @@ class NPG(OnPolicyAlgorithm):
                 # - optional: use old_policy as reference (non-local KL), may lead to indefinite curvature.
                 with th.no_grad():
                     if self.kl_ref == "current":
-                        ref_distribution = self.policy.get_distribution(rollout_data.observations)
+                        ref_distribution = self.policy.get_distribution(obs_t)
                     else:
-                        ref_distribution = old_policy.get_distribution(rollout_data.observations)
+                        ref_distribution = old_policy.get_distribution(obs_t)
 
-                distribution = self.policy.get_distribution(rollout_data.observations)
+                distribution = self.policy.get_distribution(obs_t)
                 log_prob = distribution.log_prob(actions)
 
                 advantages = rollout_data.advantages
@@ -451,7 +475,14 @@ class NPG(OnPolicyAlgorithm):
                 # detach风格：零均值优势
                 advantages = advantages - advantages.mean()
 
-                ratio = th.exp(log_prob - rollout_data.old_log_prob)
+                # Detach-style: after updating obs RMS stats, recompute pi_old (old log-prob) under updated normalization.
+                if self._obs_norm is not None and self._obs_norm.cfg.recompute_pi_old:
+                    with th.no_grad():
+                        old_log_prob = old_policy.get_distribution(obs_t).log_prob(actions)
+                else:
+                    old_log_prob = rollout_data.old_log_prob
+
+                ratio = th.exp(log_prob - old_log_prob)
                 if self.clamp_ratio:
                     ratio = th.clamp(ratio, self.min_ratio, self.max_ratio)
 
@@ -515,11 +546,11 @@ class NPG(OnPolicyAlgorithm):
 
                 with th.no_grad():
                     # For logging: compute "real" KL against old_policy (like detach's real_kl using outputs_old)
-                    old_distribution_for_log = old_policy.get_distribution(rollout_data.observations)
+                    old_distribution_for_log = old_policy.get_distribution(obs_t)
                     # This is where NaNs often surface (distribution mean/log_std)
-                    new_distribution = self.policy.get_distribution(rollout_data.observations)
+                    new_distribution = self.policy.get_distribution(obs_t)
                     new_log_prob = new_distribution.log_prob(actions)
-                    new_ratio = th.exp(new_log_prob - rollout_data.old_log_prob)
+                    new_ratio = th.exp(new_log_prob - old_log_prob)
                     if self.clamp_ratio:
                         new_ratio = th.clamp(new_ratio, self.min_ratio, self.max_ratio)
                     new_policy_objective = (new_ratio * advantages).mean()
@@ -542,13 +573,16 @@ class NPG(OnPolicyAlgorithm):
 
         for _ in range(self.v_epochs):
             for rollout_data in self.rollout_buffer.get(self.v_batch_size):
+                obs_t = rollout_data.observations
+                if self._obs_norm is not None:
+                    obs_t = self._obs_norm.normalize_tensor(obs_t)
                 target_values = rollout_data.returns.view(-1, 1)
                 if self.use_popart:
                     # PopArt 路径：保留“层层显式”计算（用于对齐/调试）
                     with th.no_grad():
                         target_values = self.policy.value_net.normalize(target_values)
 
-                    features = self.policy.extract_features(rollout_data.observations)
+                    features = self.policy.extract_features(obs_t)
                     if self.policy.share_features_extractor:
                         latent_vf = self.policy.mlp_extractor.forward_critic(features)
                     else:
@@ -559,7 +593,7 @@ class NPG(OnPolicyAlgorithm):
                     value_loss = F.mse_loss(values_pred, target_values)
                 else:
                     # 非 PopArt：走 SB3 原生路径，不再手动拆网络结构
-                    values_pred = self.policy.predict_values(rollout_data.observations)
+                    values_pred = self.policy.predict_values(obs_t)
                     value_loss = F.mse_loss(values_pred, target_values)
                 value_losses.append(value_loss.item())
 

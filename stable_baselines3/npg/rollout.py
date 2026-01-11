@@ -41,7 +41,11 @@ def collect_rollouts_npg(algo: Any, env: VecEnv, callback: BaseCallback, rollout
             algo.policy.reset_noise(env.num_envs)
 
         with th.no_grad():
-            obs_tensor = obs_as_tensor(algo._last_obs, algo.device)  # type: ignore[arg-type]
+            obs_np = algo._last_obs  # type: ignore[assignment]
+            obs_norm = getattr(algo, "_obs_norm", None)
+            if obs_norm is not None:
+                obs_np = obs_norm.normalize_np(obs_np)
+            obs_tensor = obs_as_tensor(obs_np, algo.device)  # type: ignore[arg-type]
             actions, values, log_probs = algo.policy(obs_tensor)
         actions = actions.cpu().numpy()
 
@@ -78,7 +82,11 @@ def collect_rollouts_npg(algo: Any, env: VecEnv, callback: BaseCallback, rollout
                 and infos[idx].get("terminal_observation") is not None
                 and infos[idx].get("TimeLimit.truncated", False)
             ):
-                terminal_obs = algo.policy.obs_to_tensor(infos[idx]["terminal_observation"])[0]
+                terminal_obs_np = infos[idx]["terminal_observation"]
+                obs_norm = getattr(algo, "_obs_norm", None)
+                if obs_norm is not None:
+                    terminal_obs_np = obs_norm.normalize_np(terminal_obs_np)
+                terminal_obs = algo.policy.obs_to_tensor(terminal_obs_np)[0]
                 with th.no_grad():
                     terminal_value = algo.policy.predict_values(terminal_obs)[0]  # type: ignore[arg-type]
                 # detach 对齐：TimeLimit.truncated 的 bootstrap 系数用的是 gae_lambda（Runner 里是 self.lam），不是 gamma
@@ -97,7 +105,11 @@ def collect_rollouts_npg(algo: Any, env: VecEnv, callback: BaseCallback, rollout
         algo._last_episode_starts = dones
 
     with th.no_grad():
-        values = algo.policy.predict_values(obs_as_tensor(new_obs, algo.device))  # type: ignore[arg-type]
+        last_obs_np = new_obs
+        obs_norm = getattr(algo, "_obs_norm", None)
+        if obs_norm is not None:
+            last_obs_np = obs_norm.normalize_np(last_obs_np)
+        values = algo.policy.predict_values(obs_as_tensor(last_obs_np, algo.device))  # type: ignore[arg-type]
     rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
     callback.update_locals(locals())
