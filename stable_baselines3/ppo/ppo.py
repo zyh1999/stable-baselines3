@@ -132,6 +132,8 @@ class PPO(OnPolicyAlgorithm):
         advantage_multiplier: float = 1.0,
         normalize_advantage_mean: bool = True,
         normalize_advantage_std: bool = True,
+        adam_beta1: float = 0.9,
+        adam_beta2: float = 0.999,
         separate_optimizers: bool = True,
         use_score_fisher: bool = True,
         use_adam_ablation: bool = False,
@@ -206,6 +208,8 @@ class PPO(OnPolicyAlgorithm):
         self.advantage_multiplier = advantage_multiplier
         self.normalize_advantage_mean = normalize_advantage_mean
         self.normalize_advantage_std = normalize_advantage_std
+        self.adam_beta1 = adam_beta1
+        self.adam_beta2 = adam_beta2
         self.batch_size = batch_size
         self.n_epochs = n_epochs
         self.clip_range = clip_range
@@ -246,6 +250,17 @@ class PPO(OnPolicyAlgorithm):
 
     def _setup_model(self) -> None:
         super()._setup_model()
+
+        # Adam betas override (applies to both separate_optimizers=True/False).
+        # Note: base class may have already created self.policy.optimizer when separate_optimizers=False,
+        # so we also patch the existing optimizer param_groups in that case.
+        if self.policy.optimizer_class == th.optim.Adam:
+            desired_betas = (float(self.adam_beta1), float(self.adam_beta2))
+            if "betas" not in self.policy.optimizer_kwargs:
+                self.policy.optimizer_kwargs["betas"] = desired_betas
+            if not self.separate_optimizers and isinstance(self.policy.optimizer, th.optim.Adam):
+                for param_group in self.policy.optimizer.param_groups:
+                    param_group["betas"] = desired_betas
 
         # Initialize schedules for policy/value clipping
         self.clip_range = FloatSchedule(self.clip_range)

@@ -75,7 +75,7 @@ class NPG(OnPolicyAlgorithm):
     :param target_kl: KL budget used to scale the natural gradient step
     :param n_critic_updates: Number of critic updates per policy update
     :param gae_lambda: GAE lambda
-    :param normalize_advantage: Whether to normalize advantage
+    :param adv_mean: Whether to subtract mean from advantage (mingfei-style centering)
     :param sub_sampling_factor: Sub-sample rollout batch for speed (>=1)
     :param stats_window_size: Window size for logging statistics
     :param tensorboard_log: Tensorboard log location
@@ -112,7 +112,10 @@ class NPG(OnPolicyAlgorithm):
         v_epochs: int = 10,
         v_batch_size: int = 128,
         gae_lambda: float = 0.95,
-        normalize_advantage: bool = False,
+        # Advantage preprocessing (actor update):
+        # - subtract mean (centering):  A <- A - mean(A)
+        # - scaling is handled by norm_obj via RMS, like mingfei.
+        adv_mean: bool = True,
         sub_sampling_factor: int = 1,
         action_squash: bool = False,
         clamp_ratio: bool = True,
@@ -209,7 +212,7 @@ class NPG(OnPolicyAlgorithm):
         self.v_batch_size = v_batch_size
         # If not specified, default actor minibatch size to critic minibatch size (clean default).
         self.pi_batch_size = v_batch_size if pi_batch_size is None else pi_batch_size
-        self.normalize_advantage = normalize_advantage
+        self.adv_mean = bool(adv_mean)
         self.sub_sampling_factor = sub_sampling_factor
         self.action_squash = action_squash
         self.clamp_ratio = clamp_ratio
@@ -300,8 +303,6 @@ class NPG(OnPolicyAlgorithm):
         # Basic sanity checks similar to TRPO
         if self.env is not None:
             buffer_size = self.env.num_envs * self.n_steps
-            if self.normalize_advantage:
-                assert buffer_size > 1, "`n_steps * n_envs` must be > 1 when normalizing advantage"
             if buffer_size % self.v_batch_size != 0:
                 # Warn but do not stop; critic minibatches can be uneven
                 self.logger.warning(
@@ -452,15 +453,12 @@ class NPG(OnPolicyAlgorithm):
                 if isinstance(self.action_space, spaces.Discrete):
                     actions = rollout_data.actions.long().flatten()
 
-                # KL reference distribution:
-                # - detach 对齐 (algo='true'): use current policy (detached) as reference => local KL, Fisher should be PSD.
-                # - optional: use old_policy as reference (non-local KL), may lead to indefinite curvature.
-                with th.no_grad():
-                    if self.kl_ref == "current":
-                        ref_distribution = self.policy.get_distribution(obs_t)
-                    else:
-                        ref_distribution = old_policy.get_distribution(obs_t)
-
+                # NOTE (非常关键):
+                # SB3 的 policy.get_distribution() 内部会复用同一个可变的 `self.action_dist` 对象。
+                # 如果在同一个 minibatch 里调用两次并保存引用（ref/current），第二次会覆盖第一次，
+                # 导致 Fisher 用的 KL(ref||current) 退化为 KL(current||current)=0，进而 Hessian≈0，
+                # FVP 退化为 damping * I，步长尺度失真 -> KL(old||new) 爆炸 -> lr_pi 被疯狂打下来。
+                # 所以这里我们只调用一次拿 current，然后用参数快照(detach)构造 ref。
                 distribution = self.policy.get_distribution(obs_t)
                 log_prob = distribution.log_prob(actions)
 
@@ -470,10 +468,11 @@ class NPG(OnPolicyAlgorithm):
                 # net effect is scaling by 1/std.
                 if self.use_popart:
                     advantages = self.policy.value_net.normalize(advantages.unsqueeze(-1)).squeeze(-1)
-                if self.normalize_advantage:
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                # detach风格：零均值优势
-                advantages = advantages - advantages.mean()
+                # Advantage preprocessing:
+                # - subtract mean (centering)
+                # NOTE: mingfei-style scaling is handled by norm_obj via RMS, not by std().
+                if self.adv_mean:
+                    advantages = advantages - advantages.mean()
 
                 # Detach-style: after updating obs RMS stats, recompute pi_old (old log-prob) under updated normalization.
                 if self._obs_norm is not None and self._obs_norm.cfg.recompute_pi_old:
@@ -497,9 +496,39 @@ class NPG(OnPolicyAlgorithm):
                 surrogate = ratio * advantages / (rms_sqrt + 1e-8)
                 policy_objective = surrogate.mean()
                 # 注意：我们最大化 policy_objective；loss 在后面通过负号体现
-                # detach 对齐：Fisher 用的是 KL(ref || new)
-                # Important: SB3's kl_divergence() returns per-dimension KL for Normal (shape [B, act_dim]).
-                # Detach uses sum over action dims then mean over batch: sum(-1).mean().
+                # detach 对齐：Fisher 用的是 KL(ref || current)，并且需要二阶可导（用于 Hessian-vector product）
+                if isinstance(self.action_space, spaces.Box):
+                    # current 分布参数（保留梯度）
+                    cur_normal = distribution.distribution  # type: ignore[attr-defined]
+                    mu = cur_normal.loc
+                    logstd = th.log(cur_normal.scale)
+
+                    # ref 参数（不需要梯度）：current 的 detach（local KL）或 old_policy（non-local）
+                    if self.kl_ref == "current":
+                        mu_ref = mu.detach()
+                        logstd_ref = logstd.detach()
+                    else:
+                        with th.no_grad():
+                            old_dist_ref = old_policy.get_distribution(obs_t)
+                            old_normal = old_dist_ref.distribution  # type: ignore[attr-defined]
+                            mu_ref = old_normal.loc.detach()
+                            logstd_ref = th.log(old_normal.scale).detach()
+
+                    # KL(N_ref || N_cur): log(s_cur/s_ref) + (s_ref^2 + (m_ref-m)^2)/(2 s_cur^2) - 0.5
+                    # 与 mingfei_npg/npg_detach.py 里的连续动作 KL 形式一致（逐维求和后对 batch 取 mean）
+                    kl_per_dim = (
+                        (logstd - logstd_ref)
+                        + 0.5 * (th.exp(logstd_ref).pow(2) + (mu_ref - mu).pow(2)) / th.exp(logstd).pow(2)
+                        - 0.5
+                    )
+                    kl_div = kl_per_dim.sum(dim=-1).mean()
+                else:
+                    # 非 Box 动作：保持原逻辑（注意：如果未来跑离散动作，也应做同样的“ref 参数快照”处理）
+                    with th.no_grad():
+                        if self.kl_ref == "current":
+                            ref_distribution = self.policy.get_distribution(obs_t)
+                        else:
+                            ref_distribution = old_policy.get_distribution(obs_t)
                 kl_div = sum_independent_dims(kl_divergence(ref_distribution, distribution)).mean()
                 # detach 对齐：这里只优化 surrogate objective（当前配置 ent_coef=0，对齐时不引入 entropy 项）
                 loss = -policy_objective
@@ -562,7 +591,10 @@ class NPG(OnPolicyAlgorithm):
 
         # detach 对齐：KL 自适应调 actor lr（默认用 target_kl 作为阈值）
         if self.use_kl_adaptive_lr and len(kl_divergences) > 0:
-            curr_kl = float(np.mean(kl_divergences))
+            # 对齐 detach-style 的“用最后一次 minibatch 的 KL 来调 lr”
+            # 这里的 kl_divergences 记录的是每个 minibatch 更新后，KL(old_policy || new_policy)
+            # old_policy 是本轮 rollout 开始时冻结的 pi_old（不会随着 minibatch 更新改变）
+            curr_kl = float(kl_divergences[-1])
             lr = float(self.actor_optimizer.param_groups[0]["lr"])
             if curr_kl > self.target_kl * 2.0:
                 lr = max(lr / self.lr_pi_adapt_factor, self.lr_pi_min)

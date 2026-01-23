@@ -52,6 +52,9 @@
 - **本 NPG 实现**:
   - 默认倾向于只做 **零均值化 (Zero-centering)**: $A = A - \text{mean}(A)$。
   - 虽然也支持标准归一化，但在对齐 "detach" 版本时，通常强调只减均值。
+  - **可选开关（推荐）**:
+    - `adv_subtract_mean`（默认 `True`）：控制是否做 \(A \leftarrow A - \mathrm{mean}(A)\)
+    - `adv_divide_std`（默认 `False`）：控制是否做 \(A \leftarrow A / (\mathrm{std}(A) + \epsilon)\)
 
 ## 7. 超参数 (对齐 `mlp_true`)
 
